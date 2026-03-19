@@ -120,7 +120,6 @@ def _run_agent_sync(
     thinking_queue: Optional[asyncio.Queue] = None,
     message_queue: Optional[asyncio.Queue] = None,
     clarify_queue: Optional[asyncio.Queue] = None,
-    progress_queue: Optional[asyncio.Queue] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -400,7 +399,6 @@ async def _handle_streaming(
     message_queue: asyncio.Queue = asyncio.Queue()
     thinking_queue: asyncio.Queue = asyncio.Queue()
     clarify_queue: asyncio.Queue = asyncio.Queue()
-    progress_queue: asyncio.Queue = asyncio.Queue()
 
     # Run agent in background thread
     agent_task = loop.run_in_executor(
@@ -409,7 +407,6 @@ async def _handle_streaming(
             user_message, session_id, model, max_iterations,
             cancel_event, loop, thinking_queue, message_queue,
             clarify_queue=clarify_queue,
-            progress_queue=progress_queue,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
             skip_context=skip_context, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
@@ -476,17 +473,6 @@ async def _handle_streaming(
                                     "question": clarify_data["question"],
                                     "choices": clarify_data.get("choices"),
                                     "session_id": session_id,
-                                })
-                    except asyncio.QueueEmpty:
-                        pass
-
-                    # Drain progress queue (tool progress / subagent updates)
-                    try:
-                        while True:
-                            event_type, progress_msg = progress_queue.get_nowait()
-                            if event_type == "progress" and progress_msg:
-                                yield _sse_event("ProgressEvent", {
-                                    "message": progress_msg,
                                 })
                     except asyncio.QueueEmpty:
                         pass
