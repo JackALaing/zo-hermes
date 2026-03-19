@@ -53,6 +53,7 @@ HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
 # Session tracking — active sessions that can be cancelled
 # ---------------------------------------------------------------------------
 _active_sessions: dict[str, asyncio.Event] = {}  # session_id -> cancel_event
+_session_agents: dict[str, "AIAgent"] = {}  # session_id -> last AIAgent instance
 _session_db: Optional[SessionDB] = None
 
 
@@ -90,6 +91,10 @@ class AskRequest(BaseModel):
 
 
 class CancelRequest(BaseModel):
+    session_id: str
+
+
+class SessionRequest(BaseModel):
     session_id: str
 
 
@@ -191,6 +196,7 @@ def _run_agent_sync(
         agent_kwargs["disabled_toolsets"] = disabled_toolsets
 
     agent = AIAgent(**agent_kwargs)
+    _session_agents[session_id] = agent
 
     # Change CWD for file access parity with Zo, and set CONVERSATION_ID
     # so CLI tools (zo-discord rename, etc.) can auto-detect the conversation.
@@ -219,7 +225,11 @@ def _run_agent_sync(
         logger.info("Using streamed text as final_response (was empty)")
 
     # After compression, agent.session_id may have changed. Propagate it.
-    result["_session_id"] = agent.session_id
+    effective_id = agent.session_id
+    if effective_id != session_id:
+        _session_agents[effective_id] = agent
+        _session_agents.pop(session_id, None)
+    result["_session_id"] = effective_id
     return result
 
 
@@ -475,6 +485,232 @@ async def cancel(req: CancelRequest):
 async def health():
     """Health check for Zo service monitoring."""
     return {"status": "ok", "service": "zo-hermes", "version": "0.1.0"}
+
+
+# ---------------------------------------------------------------------------
+# Session management endpoints
+# ---------------------------------------------------------------------------
+@app.post("/undo")
+async def undo(req: SessionRequest):
+    """Remove the last user+assistant exchange from a session's transcript."""
+    session_db = _get_session_db()
+    try:
+        messages = session_db.get_messages_as_conversation(req.session_id)
+    except Exception as e:
+        return JSONResponse(status_code=404, content={"error": f"Session not found: {e}"})
+
+    if not messages:
+        return JSONResponse(status_code=400, content={"error": "No messages in session"})
+
+    # Find the last user message index
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx is None:
+        return JSONResponse(status_code=400, content={"error": "No user message found to undo"})
+
+    removed = messages[last_user_idx:]
+    remaining = messages[:last_user_idx]
+
+    # Rewrite transcript: clear and re-insert remaining messages
+    session_db.clear_messages(req.session_id)
+    for msg in remaining:
+        session_db.append_message(
+            session_id=req.session_id,
+            role=msg.get("role", "unknown"),
+            content=msg.get("content"),
+            tool_name=msg.get("tool_name"),
+            tool_calls=msg.get("tool_calls"),
+            tool_call_id=msg.get("tool_call_id"),
+        )
+
+    # Also update in-memory agent history if we have one
+    agent = _session_agents.get(req.session_id)
+    if agent and hasattr(agent, "conversation_history"):
+        agent.conversation_history = remaining
+
+    return JSONResponse(content={
+        "status": "undone",
+        "session_id": req.session_id,
+        "removed_count": len(removed),
+        "remaining_count": len(remaining),
+        "removed_messages": [
+            {"role": m.get("role"), "content": (m.get("content") or "")[:500]}
+            for m in removed
+        ],
+    })
+
+
+@app.get("/status")
+async def status(session_id: str):
+    """Return running/idle state and agent info for a session."""
+    is_running = session_id in _active_sessions
+    agent = _session_agents.get(session_id)
+
+    result = {
+        "session_id": session_id,
+        "state": "running" if is_running else "idle",
+    }
+
+    if agent:
+        budget = getattr(agent, "iteration_budget", None)
+        result["iterations_used"] = budget._used if budget else 0
+        result["iterations_max"] = budget.max_total if budget else 0
+        result["model"] = getattr(agent, "model", None)
+        result["input_tokens"] = getattr(agent, "session_input_tokens", 0) or 0
+        result["output_tokens"] = getattr(agent, "session_output_tokens", 0) or 0
+        result["api_calls"] = getattr(agent, "session_api_calls", 0) or 0
+    else:
+        # No agent instance — check if session exists in DB at all
+        session_db = _get_session_db()
+        try:
+            messages = session_db.get_messages_as_conversation(session_id)
+            if not messages:
+                return JSONResponse(status_code=404, content={"error": "Session not found"})
+            result["message_count"] = len(messages)
+        except Exception:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    return JSONResponse(content=result)
+
+
+@app.get("/usage")
+async def usage(session_id: str):
+    """Return token usage details for a session."""
+    agent = _session_agents.get(session_id)
+
+    if not agent:
+        # No agent — return minimal info from DB
+        session_db = _get_session_db()
+        try:
+            messages = session_db.get_messages_as_conversation(session_id)
+            if not messages:
+                return JSONResponse(status_code=404, content={"error": "Session not found"})
+            # Estimate tokens from messages
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                approx_tokens = estimate_messages_tokens_rough(messages)
+            except Exception:
+                approx_tokens = None
+            return JSONResponse(content={
+                "session_id": session_id,
+                "message_count": len(messages),
+                "estimated_context_tokens": approx_tokens,
+                "note": "No active agent — showing estimates only",
+            })
+        except Exception:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    input_tokens = getattr(agent, "session_input_tokens", 0) or 0
+    output_tokens = getattr(agent, "session_output_tokens", 0) or 0
+    cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
+    prompt_tokens = agent.session_prompt_tokens
+    completion_tokens = agent.session_completion_tokens
+    total_tokens = agent.session_total_tokens
+    api_calls = agent.session_api_calls
+
+    compressor = agent.context_compressor
+    last_prompt = compressor.last_prompt_tokens
+    ctx_len = compressor.context_length
+    pct = (last_prompt / ctx_len * 100) if ctx_len else 0
+
+    # Cost estimation
+    cost_usd = None
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        cost_result = estimate_usage_cost(
+            agent.model,
+            CanonicalUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+            ),
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        )
+        if cost_result.amount_usd is not None:
+            cost_usd = float(cost_result.amount_usd)
+    except Exception:
+        pass
+
+    return JSONResponse(content={
+        "session_id": session_id,
+        "model": agent.model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "api_calls": api_calls,
+        "context_window_tokens": ctx_len,
+        "context_used_tokens": last_prompt,
+        "context_used_pct": round(pct, 1),
+        "compression_count": compressor.compression_count,
+        "cost_usd": cost_usd,
+    })
+
+
+@app.post("/compress")
+async def compress(req: SessionRequest):
+    """Compress context for a session — flushes memories and summarizes middle turns."""
+    agent = _session_agents.get(req.session_id)
+    if not agent:
+        return JSONResponse(status_code=404, content={
+            "error": "No active agent for this session. Send a message first via /ask.",
+        })
+
+    if not agent.compression_enabled:
+        return JSONResponse(status_code=400, content={"error": "Compression is disabled in config"})
+
+    session_db = _get_session_db()
+    try:
+        messages = session_db.get_messages_as_conversation(req.session_id)
+    except Exception:
+        messages = getattr(agent, "conversation_history", None) or []
+
+    if not messages or len(messages) < 4:
+        return JSONResponse(status_code=400, content={
+            "error": f"Not enough messages to compress (have {len(messages)}, need at least 4)",
+        })
+
+    try:
+        from agent.model_metadata import estimate_messages_tokens_rough
+        before_tokens = estimate_messages_tokens_rough(messages)
+        before_count = len(messages)
+
+        compressed, new_system = agent._compress_context(
+            messages,
+            agent._cached_system_prompt or "",
+            approx_tokens=before_tokens,
+        )
+
+        after_tokens = estimate_messages_tokens_rough(compressed)
+        after_count = len(compressed)
+
+        # The agent's session_id may have changed after compression
+        new_session_id = agent.session_id
+        if new_session_id != req.session_id:
+            _session_agents[new_session_id] = agent
+            _session_agents.pop(req.session_id, None)
+
+        return JSONResponse(content={
+            "status": "compressed",
+            "session_id": new_session_id,
+            "previous_session_id": req.session_id if new_session_id != req.session_id else None,
+            "before": {"messages": before_count, "tokens": before_tokens},
+            "after": {"messages": after_count, "tokens": after_tokens},
+        })
+
+    except Exception as e:
+        logger.exception("Compression failed for session %s", req.session_id)
+        return JSONResponse(status_code=500, content={"error": f"Compression failed: {e}"})
 
 
 # ---------------------------------------------------------------------------
