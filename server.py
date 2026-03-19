@@ -46,7 +46,7 @@ logger = logging.getLogger("zo-hermes")
 # Configuration
 # ---------------------------------------------------------------------------
 PORT = int(os.getenv("HERMES_API_PORT", "8788"))
-DEFAULT_MODEL = os.getenv("HERMES_DEFAULT_MODEL", "anthropic/claude-opus-4.6")
+DEFAULT_MODEL = os.getenv("HERMES_DEFAULT_MODEL", "gpt-5.4")
 DEFAULT_MAX_ITERATIONS = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
 
@@ -223,6 +223,18 @@ def _run_agent_sync(
             except Exception:
                 pass
 
+    # Hermes session IDs are safe to pass directly to tools like zo-discord.
+    # Inject the current session ID into the prompt so agents can target their
+    # own thread explicitly instead of relying on process-wide env vars.
+    session_hint = (
+        "## Hermes Session\n"
+        f"Your current Hermes session ID is `{session_id}`.\n"
+        "If a tool needs a conversation or session identifier, pass this exact "
+        "value explicitly instead of relying on auto-detection.\n"
+        f'For Discord thread actions, use `zo-discord --conv-id {session_id} ...`.\n\n'
+    )
+    effective_user_message = session_hint + user_message
+
     # Resolve provider (gets Claude Code OAuth token, base URL, etc.)
     provider_info = resolve_runtime_provider()
 
@@ -255,24 +267,17 @@ def _run_agent_sync(
     agent = AIAgent(**agent_kwargs)
     _session_agents[session_id] = agent
 
-    # Change CWD for file access parity with Zo, and set CONVERSATION_ID
-    # so CLI tools (zo-discord rename, etc.) can auto-detect the conversation.
+    # Change CWD for file access parity with Zo.
     original_cwd = os.getcwd()
-    original_conv_id = os.environ.get("CONVERSATION_ID")
     try:
         os.chdir(HERMES_CWD)
-        os.environ["CONVERSATION_ID"] = session_id
         result = agent.run_conversation(
-            user_message=user_message,
+            user_message=effective_user_message,
             conversation_history=conversation_history,
             stream_callback=stream_cb,
         )
     finally:
         os.chdir(original_cwd)
-        if original_conv_id is not None:
-            os.environ["CONVERSATION_ID"] = original_conv_id
-        else:
-            os.environ.pop("CONVERSATION_ID", None)
 
     # If final_response is empty but we streamed text, use the streamed text.
     # This happens when the agent does tool work and the response is in the
