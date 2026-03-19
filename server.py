@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -80,6 +80,11 @@ class AskRequest(BaseModel):
     model_name: Optional[str] = None
     persona_id: Optional[str] = None
     max_iterations: Optional[int] = None
+    reasoning_effort: Optional[str] = None  # off/low/medium/high
+    skip_memory: Optional[bool] = False
+    skip_context: Optional[bool] = False
+    enabled_toolsets: Optional[List[str]] = None
+    disabled_toolsets: Optional[List[str]] = None
 
     model_config = {"populate_by_name": True}  # accept both session_id and conversation_id
 
@@ -100,6 +105,11 @@ def _run_agent_sync(
     loop: asyncio.AbstractEventLoop,
     thinking_queue: Optional[asyncio.Queue] = None,
     message_queue: Optional[asyncio.Queue] = None,
+    reasoning_effort: Optional[str] = None,
+    skip_memory: bool = False,
+    skip_context: bool = False,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
 ) -> dict:
     """
     Instantiate AIAgent and run a conversation turn. Called from threadpool.
@@ -157,7 +167,7 @@ def _run_agent_sync(
     provider_info = resolve_runtime_provider()
 
     # Instantiate agent
-    agent = AIAgent(
+    agent_kwargs = dict(
         session_id=session_id,
         session_db=session_db,
         base_url=provider_info.get("base_url"),
@@ -170,8 +180,17 @@ def _run_agent_sync(
         max_iterations=max_iterations,
         save_trajectories=True,
         reasoning_callback=reasoning_cb,
-        reasoning_config={"effort": "medium"},
+        reasoning_config={"effort": reasoning_effort or "medium"},
+        pass_session_id=True,
+        skip_memory=skip_memory,
+        skip_context_files=skip_context,
     )
+    if enabled_toolsets is not None:
+        agent_kwargs["enabled_toolsets"] = enabled_toolsets
+    if disabled_toolsets is not None:
+        agent_kwargs["disabled_toolsets"] = disabled_toolsets
+
+    agent = AIAgent(**agent_kwargs)
 
     # Change CWD for file access parity with Zo, and set CONVERSATION_ID
     # so CLI tools (zo-discord rename, etc.) can auto-detect the conversation.
@@ -238,6 +257,11 @@ async def ask(req: AskRequest):
     # Ignore Zo BYOK model IDs (e.g. "byok:xxx") — use default Hermes model instead
     model = req.model_name if req.model_name and not req.model_name.startswith("byok:") else DEFAULT_MODEL
     max_iterations = req.max_iterations or DEFAULT_MAX_ITERATIONS
+    reasoning_effort = req.reasoning_effort
+    skip_memory = req.skip_memory or False
+    skip_context = req.skip_context or False
+    enabled_toolsets = req.enabled_toolsets
+    disabled_toolsets = req.disabled_toolsets
 
     # Register cancel event
     cancel_event = asyncio.Event()
@@ -245,9 +269,19 @@ async def ask(req: AskRequest):
 
     try:
         if req.stream:
-            return await _handle_streaming(req.input, session_id, model, max_iterations, cancel_event)
+            return await _handle_streaming(
+                req.input, session_id, model, max_iterations, cancel_event,
+                reasoning_effort=reasoning_effort, skip_memory=skip_memory,
+                skip_context=skip_context, enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+            )
         else:
-            return await _handle_non_streaming(req.input, session_id, model, max_iterations, cancel_event)
+            return await _handle_non_streaming(
+                req.input, session_id, model, max_iterations, cancel_event,
+                reasoning_effort=reasoning_effort, skip_memory=skip_memory,
+                skip_context=skip_context, enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+            )
     finally:
         _active_sessions.pop(session_id, None)
 
@@ -258,6 +292,11 @@ async def _handle_non_streaming(
     model: str,
     max_iterations: int,
     cancel_event: asyncio.Event,
+    reasoning_effort: Optional[str] = None,
+    skip_memory: bool = False,
+    skip_context: bool = False,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
 ) -> JSONResponse:
     """Non-streaming mode for zo-dispatcher: returns JSON with output + conversation_id."""
     loop = asyncio.get_event_loop()
@@ -265,15 +304,13 @@ async def _handle_non_streaming(
     try:
         result = await loop.run_in_executor(
             None,
-            _run_agent_sync,
-            user_message,
-            session_id,
-            model,
-            max_iterations,
-            cancel_event,
-            loop,
-            None,  # no thinking_queue
-            None,  # no message_queue
+            lambda: _run_agent_sync(
+                user_message, session_id, model, max_iterations,
+                cancel_event, loop, None, None,
+                reasoning_effort=reasoning_effort, skip_memory=skip_memory,
+                skip_context=skip_context, enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+            ),
         )
 
         output = result.get("final_response", "")
@@ -297,6 +334,11 @@ async def _handle_streaming(
     model: str,
     max_iterations: int,
     cancel_event: asyncio.Event,
+    reasoning_effort: Optional[str] = None,
+    skip_memory: bool = False,
+    skip_context: bool = False,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
 ) -> StreamingResponse:
     """Streaming mode for zo-discord: returns SSE with Zo-compatible events."""
     loop = asyncio.get_event_loop()
@@ -306,15 +348,13 @@ async def _handle_streaming(
     # Run agent in background thread
     agent_task = loop.run_in_executor(
         None,
-        _run_agent_sync,
-        user_message,
-        session_id,
-        model,
-        max_iterations,
-        cancel_event,
-        loop,
-        thinking_queue,
-        message_queue,
+        lambda: _run_agent_sync(
+            user_message, session_id, model, max_iterations,
+            cancel_event, loop, thinking_queue, message_queue,
+            reasoning_effort=reasoning_effort, skip_memory=skip_memory,
+            skip_context=skip_context, enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        ),
     )
 
     async def event_generator():
