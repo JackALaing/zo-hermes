@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +57,9 @@ _active_sessions: dict[str, asyncio.Event] = {}  # session_id -> cancel_event
 _session_agents: dict[str, "AIAgent"] = {}  # session_id -> last AIAgent instance
 _session_db: Optional[SessionDB] = None
 
+# Pending clarify requests: session_id -> {event, response, question, choices}
+_pending_clarify: dict[str, dict] = {}
+
 
 def _get_session_db() -> SessionDB:
     global _session_db
@@ -98,6 +102,11 @@ class SessionRequest(BaseModel):
     session_id: str
 
 
+class ClarifyResponse(BaseModel):
+    session_id: str
+    response: str
+
+
 # ---------------------------------------------------------------------------
 # Agent runner (sync, runs in threadpool)
 # ---------------------------------------------------------------------------
@@ -110,6 +119,8 @@ def _run_agent_sync(
     loop: asyncio.AbstractEventLoop,
     thinking_queue: Optional[asyncio.Queue] = None,
     message_queue: Optional[asyncio.Queue] = None,
+    clarify_queue: Optional[asyncio.Queue] = None,
+    progress_queue: Optional[asyncio.Queue] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -168,6 +179,50 @@ def _run_agent_sync(
             except Exception:
                 pass
 
+    # Clarify callback: blocks agent thread, signals SSE to emit ClarifyEvent,
+    # waits for response from POST /clarify-response
+    clarify_cb = None
+    if clarify_queue is not None:
+        def clarify_cb(question: str, choices):
+            response_event = threading.Event()
+            clarify_state = {
+                "event": response_event,
+                "response": None,
+                "question": question,
+                "choices": choices,
+            }
+            _pending_clarify[session_id] = clarify_state
+            try:
+                loop.call_soon_threadsafe(
+                    clarify_queue.put_nowait,
+                    ("clarify", {"question": question, "choices": choices}),
+                )
+                # Block until response arrives or 120s timeout
+                if response_event.wait(timeout=120):
+                    return clarify_state["response"] or ""
+                return (
+                    "The user did not provide a response within the time limit. "
+                    "Use your best judgement to make the choice and proceed."
+                )
+            finally:
+                _pending_clarify.pop(session_id, None)
+
+    # Tool progress callback: relays tool names (incl. subagent_progress)
+    # to SSE ProgressEvent so zo-discord can show delegation progress.
+    progress_cb = None
+    if progress_queue is not None:
+        def progress_cb(tool_name: str, preview: str = None, args=None):
+            try:
+                if preview:
+                    msg = f"{tool_name}: {preview}"
+                else:
+                    msg = tool_name
+                loop.call_soon_threadsafe(
+                    progress_queue.put_nowait, ("progress", msg)
+                )
+            except Exception:
+                pass
+
     # Resolve provider (gets Claude Code OAuth token, base URL, etc.)
     provider_info = resolve_runtime_provider()
 
@@ -185,6 +240,8 @@ def _run_agent_sync(
         max_iterations=max_iterations,
         save_trajectories=True,
         reasoning_callback=reasoning_cb,
+        clarify_callback=clarify_cb,
+        tool_progress_callback=progress_cb,
         reasoning_config={"effort": reasoning_effort or "medium"},
         pass_session_id=True,
         skip_memory=skip_memory,
@@ -354,6 +411,8 @@ async def _handle_streaming(
     loop = asyncio.get_event_loop()
     message_queue: asyncio.Queue = asyncio.Queue()
     thinking_queue: asyncio.Queue = asyncio.Queue()
+    clarify_queue: asyncio.Queue = asyncio.Queue()
+    progress_queue: asyncio.Queue = asyncio.Queue()
 
     # Run agent in background thread
     agent_task = loop.run_in_executor(
@@ -361,6 +420,8 @@ async def _handle_streaming(
         lambda: _run_agent_sync(
             user_message, session_id, model, max_iterations,
             cancel_event, loop, thinking_queue, message_queue,
+            clarify_queue=clarify_queue,
+            progress_queue=progress_queue,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
             skip_context=skip_context, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
@@ -411,6 +472,34 @@ async def _handle_streaming(
                                     }
                                 })
                                 text_buffer += content
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    # Drain clarify queue
+                    try:
+                        while True:
+                            event_type, clarify_data = clarify_queue.get_nowait()
+                            if event_type == "clarify":
+                                # Close any open text part before clarify
+                                if in_text_part:
+                                    yield _sse_event("PartEndEvent", {})
+                                    in_text_part = False
+                                yield _sse_event("ClarifyEvent", {
+                                    "question": clarify_data["question"],
+                                    "choices": clarify_data.get("choices"),
+                                    "session_id": session_id,
+                                })
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    # Drain progress queue (tool progress / subagent updates)
+                    try:
+                        while True:
+                            event_type, progress_msg = progress_queue.get_nowait()
+                            if event_type == "progress" and progress_msg:
+                                yield _sse_event("ProgressEvent", {
+                                    "message": progress_msg,
+                                })
                     except asyncio.QueueEmpty:
                         pass
 
@@ -479,6 +568,20 @@ async def cancel(req: CancelRequest):
         status_code=404,
         content={"error": "Session not found or already completed", "session_id": req.session_id},
     )
+
+
+@app.post("/clarify-response")
+async def clarify_response(req: ClarifyResponse):
+    """Provide the user's response to a pending clarify question."""
+    state = _pending_clarify.get(req.session_id)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No pending clarify request for this session"},
+        )
+    state["response"] = req.response
+    state["event"].set()
+    return JSONResponse(content={"status": "ok", "session_id": req.session_id})
 
 
 @app.get("/health")

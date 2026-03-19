@@ -36,6 +36,7 @@ Claude (model specified in config)
 | `GET` | `/usage?session_id=X` | Detailed token usage, cost estimate, context window utilization. |
 | `POST` | `/undo` | Remove last user+assistant exchange from a session transcript. |
 | `POST` | `/compress` | Force context compression on a session. |
+| `POST` | `/clarify-response` | Provide user's response to a pending clarify question. Body: `{session_id, response}`. |
 
 ### `/ask` request body
 
@@ -64,6 +65,8 @@ Matches Zo-native SSE so zo-discord can consume both backends without changes:
 
 - **Thinking**: `PartStartEvent {part: {part_kind: "thinking", content: "full block"}}` → `PartEndEvent {}`
 - **Text deltas**: `PartStartEvent {part: {part_kind: "text"}}` → `PartDeltaEvent {delta: {content_delta: "..."}}` (repeated) → `PartEndEvent {}`
+- **Clarify**: `ClarifyEvent {question: "...", choices: [...], session_id: "..."}` — emitted when agent calls the clarify tool. The agent thread blocks until a response is posted to `POST /clarify-response`.
+- **Progress**: `ProgressEvent {message: "..."}` — emitted for tool execution progress and subagent delegation updates. Subagent progress messages are prefixed with `🔀`.
 - **End**: `End {data: {output: "full response", conversation_id: "session_id"}}`
 
 ### Thinking dedup
