@@ -207,22 +207,6 @@ def _run_agent_sync(
             finally:
                 _pending_clarify.pop(session_id, None)
 
-    # Tool progress callback: relays tool names (incl. subagent_progress)
-    # to SSE ProgressEvent so zo-discord can show delegation progress.
-    progress_cb = None
-    if progress_queue is not None:
-        def progress_cb(tool_name: str, preview: str = None, args=None):
-            try:
-                if preview:
-                    msg = f"{tool_name}: {preview}"
-                else:
-                    msg = tool_name
-                loop.call_soon_threadsafe(
-                    progress_queue.put_nowait, ("progress", msg)
-                )
-            except Exception:
-                pass
-
     # Hermes session IDs are safe to pass directly to tools like zo-discord.
     # Inject the current session ID into the prompt so agents can target their
     # own thread explicitly instead of relying on process-wide env vars.
@@ -253,7 +237,6 @@ def _run_agent_sync(
         save_trajectories=True,
         reasoning_callback=reasoning_cb,
         clarify_callback=clarify_cb,
-        tool_progress_callback=progress_cb,
         reasoning_config={"effort": reasoning_effort or "medium"},
         pass_session_id=True,
         skip_memory=skip_memory,
