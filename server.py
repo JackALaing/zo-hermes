@@ -23,11 +23,32 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+def _expand_config_env(value):
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    if isinstance(value, list):
+        return [_expand_config_env(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand_config_env(item) for key, item in value.items()}
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Hermes imports — add repo to path
 # ---------------------------------------------------------------------------
 HERMES_ROOT = Path("/opt/hermes-agent")
 sys.path.insert(0, str(HERMES_ROOT))
+
+from hermes_cli import config as hermes_config  # noqa: E402
+
+_original_load_config = hermes_config.load_config
+
+
+def _load_config_with_expanded_env():
+    return _expand_config_env(_original_load_config())
+
+
+hermes_config.load_config = _load_config_with_expanded_env
 
 from run_agent import AIAgent  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402

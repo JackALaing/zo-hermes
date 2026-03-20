@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -65,6 +66,16 @@ def load_server_module():
         "api_key": "test-key",
         "provider": "test-provider",
         "api_mode": "responses",
+    }
+    fake_config = types.ModuleType("hermes_cli.config")
+    fake_config.load_config = lambda: {
+        "mcp_servers": {
+            "zo": {
+                "headers": {
+                    "Authorization": "Bearer ${HERMES_ZO_ACCESS_TOKEN}"
+                }
+            }
+        }
     }
 
     fake_fastapi = types.ModuleType("fastapi")
@@ -141,6 +152,7 @@ def load_server_module():
     sys.modules["run_agent"] = fake_run_agent
     sys.modules["hermes_state"] = fake_state
     sys.modules["hermes_cli"] = fake_runtime_parent
+    sys.modules["hermes_cli.config"] = fake_config
     sys.modules["hermes_cli.runtime_provider"] = fake_runtime
     sys.modules["fastapi"] = fake_fastapi
     sys.modules["fastapi.responses"] = fake_fastapi_responses
@@ -166,6 +178,22 @@ class TestAskRequest:
         module = load_server_module()
         req = module.AskRequest.model_validate({"input": "hello", "session_id": "sess-1"})
         assert req.session_id == "sess-1"
+
+
+class TestZoMcpConfigExpansion:
+    def test_expands_env_vars_in_loaded_config(self):
+        original_token = os.environ.get("HERMES_ZO_ACCESS_TOKEN")
+        try:
+            os.environ["HERMES_ZO_ACCESS_TOKEN"] = "header.payload.signature"
+            module = load_server_module()
+            cfg = module.hermes_config.load_config()
+            auth = cfg["mcp_servers"]["zo"]["headers"]["Authorization"]
+            assert auth == "Bearer header.payload.signature"
+        finally:
+            if original_token is None:
+                os.environ.pop("HERMES_ZO_ACCESS_TOKEN", None)
+            else:
+                os.environ["HERMES_ZO_ACCESS_TOKEN"] = original_token
 
 
 class TestAskEndpoint:
