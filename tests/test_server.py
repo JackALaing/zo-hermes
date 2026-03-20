@@ -208,11 +208,32 @@ class TestZoMcpConfigExpansion:
             cfg = module.hermes_config.load_config()
             auth = cfg["mcp_servers"]["zo"]["headers"]["Authorization"]
             assert auth == "Bearer header.payload.signature"
+            assert cfg["mcp_servers"]["zo"]["tools"]["include"] == module.DEFAULT_ZO_MCP_INCLUDE_TOOLS
+            assert cfg["mcp_servers"]["zo"]["tools"]["resources"] is False
+            assert cfg["mcp_servers"]["zo"]["tools"]["prompts"] is False
         finally:
             if original_token is None:
                 os.environ.pop("HERMES_ZO_ACCESS_TOKEN", None)
             else:
                 os.environ["HERMES_ZO_ACCESS_TOKEN"] = original_token
+
+    def test_preserves_explicit_zo_tools_policy(self):
+        module = load_server_module()
+        custom_cfg = {
+            "mcp_servers": {
+                "zo": {
+                    "tools": {
+                        "include": ["custom_tool"],
+                        "resources": True,
+                        "prompts": True,
+                    }
+                }
+            }
+        }
+        result = module._apply_default_zo_mcp_policy(custom_cfg)
+        assert result["mcp_servers"]["zo"]["tools"]["include"] == ["custom_tool"]
+        assert result["mcp_servers"]["zo"]["tools"]["resources"] is True
+        assert result["mcp_servers"]["zo"]["tools"]["prompts"] is True
 
     def test_normalizes_mcp_alias_to_configured_server_toolset(self):
         module = load_server_module()

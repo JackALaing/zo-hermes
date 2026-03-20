@@ -17,7 +17,7 @@ zo-hermes (server.py:8788)
     ↓  runs in threadpool
 Hermes AIAgent (/opt/hermes-agent/run_agent.py)
     ↓  Anthropic API calls
-Claude (model specified in config)
+Codex/Hermes runtime (model specified in config)
 ```
 
 - **zo-hermes** is a FastAPI app running on `localhost:8788` (configurable via `HERMES_API_PORT`)
@@ -45,19 +45,77 @@ Claude (model specified in config)
   "input": "user message",
   "stream": true,
   "conversation_id": "optional session ID to continue",
-  "model_name": "anthropic/claude-opus-4.6",
+  "model_name": "gpt-5.4",
   "max_iterations": 90,
   "reasoning_effort": "medium",
   "skip_memory": false,
   "skip_context": false,
-  "enabled_toolsets": ["web", "bash"],
+  "enabled_toolsets": ["web", "terminal"],
   "disabled_toolsets": ["dangerous"]
 }
 ```
 
 - `conversation_id` and `session_id` are aliases (both accepted)
 - BYOK model IDs (`byok:xxx`) are ignored — defaults to `HERMES_DEFAULT_MODEL`
+- MCP toolsets are server-specific. For Zo MCP, use `["zo"]` or `["mcp-zo"]`. Bare `["mcp"]` is treated as an alias for all configured MCP servers.
+- `zo-hermes` applies a default filter to the `zo` MCP server when no explicit `mcp_servers.zo.tools` policy exists yet, so Hermes only sees a narrow Zo-specific admin surface by default.
 - Streaming returns SSE events matching Zo's format: `PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`
+
+## Default Zo MCP policy
+
+When `~/.hermes/config.yaml` contains a `zo` MCP server with no explicit `tools` policy, `zo-hermes` injects this default:
+
+```yaml
+mcp_servers:
+  zo:
+    url: "https://api.zo.computer/mcp"
+    headers:
+      Authorization: "Bearer ${HERMES_ZO_ACCESS_TOKEN}"
+    tools:
+      include:
+        - change_hardware
+        - list_user_services
+        - register_user_service
+        - update_user_service
+        - delete_user_service
+        - service_doctor
+        - proxy_local_service
+        - create_website
+        - list_space_routes
+        - get_space_route
+        - update_space_route
+        - delete_space_route
+        - list_space_assets
+        - update_space_asset
+        - delete_space_asset
+        - get_space_errors
+        - update_user_settings
+      resources: false
+      prompts: false
+```
+
+This keeps Zo MCP focused on the Zo-specific operations Hermes does not already provide natively, and trims overlapping shell, file, browser, search, media, messaging, and built-in Zo agent-management tools from the default tool surface.
+
+## Overriding the default
+
+If you want a different Zo MCP surface, set `mcp_servers.zo.tools` yourself in `~/.hermes/config.yaml`. `zo-hermes` only applies the default when that key is absent.
+
+Example override:
+
+```yaml
+mcp_servers:
+  zo:
+    url: "https://api.zo.computer/mcp"
+    headers:
+      Authorization: "Bearer ${HERMES_ZO_ACCESS_TOKEN}"
+    tools:
+      include:
+        - update_user_service
+        - service_doctor
+        - get_space_errors
+      resources: false
+      prompts: false
+```
 
 ## SSE event format (streaming mode)
 
@@ -66,7 +124,6 @@ Matches Zo-native SSE so zo-discord can consume both backends without changes:
 - **Thinking**: `PartStartEvent {part: {part_kind: "thinking", content: "full block"}}` → `PartEndEvent {}`
 - **Text deltas**: `PartStartEvent {part: {part_kind: "text"}}` → `PartDeltaEvent {delta: {content_delta: "..."}}` (repeated) → `PartEndEvent {}`
 - **Clarify**: `ClarifyEvent {question: "...", choices: [...], session_id: "..."}` — emitted when agent calls the clarify tool. The agent thread blocks until a response is posted to `POST /clarify-response`.
-- **Progress**: `ProgressEvent {message: "..."}` — emitted for tool execution progress and subagent delegation updates. Subagent progress messages are prefixed with `🔀`.
 - **End**: `End {data: {output: "full response", conversation_id: "session_id"}}`
 
 ### Thinking dedup
@@ -82,7 +139,7 @@ zo-hermes deduplicates by accumulating deltas silently and only forwarding the f
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HERMES_API_PORT` | `8788` | Port to listen on |
-| `HERMES_DEFAULT_MODEL` | `anthropic/claude-opus-4.6` | Model when none specified or BYOK ID received |
+| `HERMES_DEFAULT_MODEL` | `gpt-5.4` | Model when none specified or BYOK ID received |
 | `HERMES_MAX_ITERATIONS` | `90` | Max agent iterations per request |
 | `HERMES_CWD` | `/home/workspace` | Working directory for the agent |
 

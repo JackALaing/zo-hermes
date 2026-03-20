@@ -23,6 +23,27 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+DEFAULT_ZO_MCP_INCLUDE_TOOLS = [
+    "change_hardware",
+    "list_user_services",
+    "register_user_service",
+    "update_user_service",
+    "delete_user_service",
+    "service_doctor",
+    "proxy_local_service",
+    "create_website",
+    "list_space_routes",
+    "get_space_route",
+    "update_space_route",
+    "delete_space_route",
+    "list_space_assets",
+    "update_space_asset",
+    "delete_space_asset",
+    "get_space_errors",
+    "update_user_settings",
+]
+
+
 def _expand_config_env(value):
     if isinstance(value, str):
         return os.path.expandvars(value)
@@ -45,7 +66,32 @@ _original_load_config = hermes_config.load_config
 
 
 def _load_config_with_expanded_env():
-    return _expand_config_env(_original_load_config())
+    cfg = _expand_config_env(_original_load_config())
+    return _apply_default_zo_mcp_policy(cfg)
+
+
+def _apply_default_zo_mcp_policy(cfg):
+    if not isinstance(cfg, dict):
+        return cfg
+
+    servers = cfg.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return cfg
+
+    zo_cfg = servers.get("zo")
+    if not isinstance(zo_cfg, dict):
+        return cfg
+
+    tools_cfg = zo_cfg.get("tools")
+    if tools_cfg is not None:
+        return cfg
+
+    zo_cfg["tools"] = {
+        "include": list(DEFAULT_ZO_MCP_INCLUDE_TOOLS),
+        "resources": False,
+        "prompts": False,
+    }
+    return cfg
 
 
 hermes_config.load_config = _load_config_with_expanded_env
