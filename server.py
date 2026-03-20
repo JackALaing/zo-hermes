@@ -50,6 +50,7 @@ def _load_config_with_expanded_env():
 
 hermes_config.load_config = _load_config_with_expanded_env
 
+from model_tools import get_tool_definitions as _get_tool_definitions  # noqa: E402
 from run_agent import AIAgent  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
@@ -94,6 +95,64 @@ def _generate_session_id() -> str:
     now = time.strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
     return f"{now}_{suffix}"
+
+
+def _is_enabled_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _configured_mcp_toolsets() -> List[str]:
+    cfg = hermes_config.load_config() or {}
+    servers = cfg.get("mcp_servers") or {}
+    toolsets: List[str] = []
+    for name, server_cfg in servers.items():
+        if not isinstance(server_cfg, dict):
+            continue
+        if _is_enabled_flag(server_cfg.get("enabled", True)):
+            toolsets.append(f"mcp-{name}")
+    return toolsets
+
+
+def _normalize_enabled_toolsets(enabled_toolsets: Optional[List[str]]) -> Optional[List[str]]:
+    if enabled_toolsets is None:
+        return None
+
+    normalized: List[str] = []
+    mcp_toolsets: Optional[List[str]] = None
+
+    for name in enabled_toolsets:
+        if name == "mcp":
+            if mcp_toolsets is None:
+                mcp_toolsets = _configured_mcp_toolsets()
+            normalized.extend(mcp_toolsets)
+            continue
+        if name:
+            normalized.append(name)
+
+    return list(dict.fromkeys(normalized))
+
+
+def _validate_enabled_toolsets(enabled_toolsets: Optional[List[str]]) -> Optional[List[str]]:
+    normalized = _normalize_enabled_toolsets(enabled_toolsets)
+    if normalized is None:
+        return None
+    if not normalized:
+        raise ValueError(
+            "enabled_toolsets resolved to no configured MCP servers. "
+            "Use a concrete Hermes toolset such as 'web' or 'file', or a configured MCP server alias like 'zo' or 'mcp-zo'."
+        )
+
+    tool_defs = _get_tool_definitions(enabled_toolsets=normalized, quiet_mode=True)
+    if not tool_defs:
+        raise ValueError(
+            f"enabled_toolsets={normalized} resolved to zero available tools. "
+            "For Zo MCP, use a configured server alias like 'zo' or 'mcp-zo'. Bare 'mcp' is only an alias for configured MCP servers."
+        )
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +394,14 @@ async def ask(req: AskRequest):
     reasoning_effort = req.reasoning_effort
     skip_memory = req.skip_memory or False
     skip_context = req.skip_context or False
-    enabled_toolsets = req.enabled_toolsets
+    try:
+        enabled_toolsets = _validate_enabled_toolsets(req.enabled_toolsets)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e), "conversation_id": session_id},
+            headers={"X-Conversation-Id": session_id},
+        )
     disabled_toolsets = req.disabled_toolsets
 
     # Register cancel event

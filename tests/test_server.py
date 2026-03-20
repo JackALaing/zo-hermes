@@ -77,6 +77,24 @@ def load_server_module():
             }
         }
     }
+    fake_model_tools = types.ModuleType("model_tools")
+
+    def fake_get_tool_definitions(enabled_toolsets=None, disabled_toolsets=None, quiet_mode=False):
+        if enabled_toolsets is None:
+            return [{"function": {"name": "default_tool"}}]
+        names = set(enabled_toolsets)
+        valid = {
+            "web",
+            "file",
+            "terminal",
+            "mcp-zo",
+            "zo",
+        }
+        if names & valid:
+            return [{"function": {"name": "mock_tool"}}]
+        return []
+
+    fake_model_tools.get_tool_definitions = fake_get_tool_definitions
 
     fake_fastapi = types.ModuleType("fastapi")
     fake_fastapi_responses = types.ModuleType("fastapi.responses")
@@ -154,6 +172,7 @@ def load_server_module():
     sys.modules["hermes_cli"] = fake_runtime_parent
     sys.modules["hermes_cli.config"] = fake_config
     sys.modules["hermes_cli.runtime_provider"] = fake_runtime
+    sys.modules["model_tools"] = fake_model_tools
     sys.modules["fastapi"] = fake_fastapi
     sys.modules["fastapi.responses"] = fake_fastapi_responses
     sys.modules["pydantic"] = fake_pydantic
@@ -195,6 +214,19 @@ class TestZoMcpConfigExpansion:
             else:
                 os.environ["HERMES_ZO_ACCESS_TOKEN"] = original_token
 
+    def test_normalizes_mcp_alias_to_configured_server_toolset(self):
+        module = load_server_module()
+        assert module._normalize_enabled_toolsets(["mcp"]) == ["mcp-zo"]
+
+    def test_rejects_empty_mcp_alias_when_no_servers_enabled(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"mcp_servers": {"zo": {"enabled": False}}}
+        try:
+            module._validate_enabled_toolsets(["mcp"])
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "no configured MCP servers" in str(e)
+
 
 class TestAskEndpoint:
     def test_non_streaming_ask_threads_all_new_params(self):
@@ -230,6 +262,27 @@ class TestAskEndpoint:
         assert captured["kwargs"]["enabled_toolsets"] == ["web"]
         assert captured["kwargs"]["disabled_toolsets"] == ["rl"]
 
+    def test_non_streaming_ask_normalizes_mcp_alias(self):
+        module = load_server_module()
+        captured = {}
+
+        async def fake_non_streaming(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"ok": True}
+
+        module._handle_non_streaming = fake_non_streaming
+        req = module.AskRequest.model_validate(
+            {
+                "input": "hello",
+                "stream": False,
+                "enabled_toolsets": ["mcp"],
+            }
+        )
+
+        run(module.ask(req))
+
+        assert captured["kwargs"]["enabled_toolsets"] == ["mcp-zo"]
+
     def test_streaming_ask_threads_all_new_params(self):
         module = load_server_module()
         captured = {}
@@ -259,6 +312,22 @@ class TestAskEndpoint:
         assert captured["kwargs"]["reasoning_effort"] == "low"
         assert captured["kwargs"]["enabled_toolsets"] == ["file"]
         assert captured["kwargs"]["disabled_toolsets"] == ["browser"]
+
+    def test_ask_returns_400_when_enabled_toolsets_resolve_to_zero_tools(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"mcp_servers": {"zo": {"enabled": False}}}
+        req = module.AskRequest.model_validate(
+            {
+                "input": "hello",
+                "enabled_toolsets": ["mcp"],
+            }
+        )
+
+        response = run(module.ask(req))
+        body = json.loads(response.body)
+
+        assert response.status_code == 400
+        assert "no configured MCP servers" in body["error"]
 
 
 class TestSessionEndpoints:
