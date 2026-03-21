@@ -210,6 +210,7 @@ class AskRequest(BaseModel):
     session_id: Optional[str] = Field(None, alias="conversation_id")
     model_name: Optional[str] = None
     persona_id: Optional[str] = None
+    ephemeral_system_prompt: Optional[str] = None
     max_iterations: Optional[int] = None
     reasoning_effort: Optional[str] = None  # off/low/medium/high
     skip_memory: Optional[bool] = False
@@ -246,6 +247,7 @@ def _run_agent_sync(
     thinking_queue: Optional[asyncio.Queue] = None,
     message_queue: Optional[asyncio.Queue] = None,
     clarify_queue: Optional[asyncio.Queue] = None,
+    ephemeral_system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -332,18 +334,6 @@ def _run_agent_sync(
             finally:
                 _pending_clarify.pop(session_id, None)
 
-    # Hermes session IDs are safe to pass directly to tools like zo-discord.
-    # Inject the current session ID into the prompt so agents can target their
-    # own thread explicitly instead of relying on process-wide env vars.
-    session_hint = (
-        "## Hermes Session\n"
-        f"Your current Hermes session ID is `{session_id}`.\n"
-        "If a tool needs a conversation or session identifier, pass this exact "
-        "value explicitly instead of relying on auto-detection.\n"
-        f'For Discord thread actions, use `zo-discord --conv-id {session_id} ...`.\n\n'
-    )
-    effective_user_message = session_hint + user_message
-
     # Resolve provider (gets Claude Code OAuth token, base URL, etc.)
     provider_info = resolve_runtime_provider()
 
@@ -364,6 +354,7 @@ def _run_agent_sync(
         clarify_callback=clarify_cb,
         reasoning_config={"effort": reasoning_effort or "medium"},
         pass_session_id=True,
+        ephemeral_system_prompt=ephemeral_system_prompt,
         skip_memory=skip_memory,
         skip_context_files=skip_context,
     )
@@ -380,7 +371,7 @@ def _run_agent_sync(
     try:
         os.chdir(HERMES_CWD)
         result = agent.run_conversation(
-            user_message=effective_user_message,
+            user_message=user_message,
             conversation_history=conversation_history,
             stream_callback=stream_cb,
         )
@@ -458,6 +449,7 @@ async def ask(req: AskRequest):
         if req.stream:
             return await _handle_streaming(
                 req.input, session_id, model, max_iterations, cancel_event,
+                ephemeral_system_prompt=req.ephemeral_system_prompt,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -465,6 +457,7 @@ async def ask(req: AskRequest):
         else:
             return await _handle_non_streaming(
                 req.input, session_id, model, max_iterations, cancel_event,
+                ephemeral_system_prompt=req.ephemeral_system_prompt,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -479,6 +472,7 @@ async def _handle_non_streaming(
     model: str,
     max_iterations: int,
     cancel_event: asyncio.Event,
+    ephemeral_system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -494,6 +488,7 @@ async def _handle_non_streaming(
             lambda: _run_agent_sync(
                 user_message, session_id, model, max_iterations,
                 cancel_event, loop, None, None,
+                ephemeral_system_prompt=ephemeral_system_prompt,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -521,6 +516,7 @@ async def _handle_streaming(
     model: str,
     max_iterations: int,
     cancel_event: asyncio.Event,
+    ephemeral_system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -540,6 +536,7 @@ async def _handle_streaming(
             user_message, session_id, model, max_iterations,
             cancel_event, loop, thinking_queue, message_queue,
             clarify_queue=clarify_queue,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
             skip_context=skip_context, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,

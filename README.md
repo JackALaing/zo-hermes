@@ -45,6 +45,7 @@ Codex/Hermes runtime (model specified in config)
   "input": "user message",
   "stream": true,
   "conversation_id": "optional session ID to continue",
+  "ephemeral_system_prompt": "optional per-request overlay",
   "model_name": "gpt-5.4",
   "max_iterations": 90,
   "reasoning_effort": "medium",
@@ -56,6 +57,7 @@ Codex/Hermes runtime (model specified in config)
 ```
 
 - `conversation_id` and `session_id` are aliases (both accepted)
+- `ephemeral_system_prompt` is forwarded to Hermes as a request-time overlay. Use this for gateway/session context such as Discord metadata, not for the user's actual message text.
 - BYOK model IDs (`byok:xxx`) are ignored — defaults to `HERMES_DEFAULT_MODEL`
 - MCP toolsets are server-specific. For Zo MCP, use `["zo"]` or `["mcp-zo"]`. Bare `["mcp"]` is treated as an alias for all configured MCP servers.
 - `zo-hermes` applies a default filter to the `zo` MCP server when no explicit `mcp_servers.zo.tools` policy exists yet, so Hermes only sees a narrow Zo-specific admin surface by default.

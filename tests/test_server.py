@@ -14,6 +14,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def collect_stream(response):
+    chunks = []
+    async for chunk in response.content:
+        chunks.append(chunk)
+    return chunks
+
+
 class FakeSessionDB:
     def __init__(self):
         self.messages = {}
@@ -250,6 +257,23 @@ class TestZoMcpConfigExpansion:
 
 
 class TestAskEndpoint:
+    def test_ask_ignores_byok_model_ids_and_uses_default_model(self):
+        module = load_server_module()
+        captured = {}
+
+        async def fake_non_streaming(*args, **kwargs):
+            captured["args"] = args
+            return {"ok": True}
+
+        module._handle_non_streaming = fake_non_streaming
+        req = module.AskRequest.model_validate(
+            {"input": "hello", "stream": False, "model_name": "byok:test-model"}
+        )
+
+        run(module.ask(req))
+
+        assert captured["args"][2] == module.DEFAULT_MODEL
+
     def test_non_streaming_ask_threads_all_new_params(self):
         module = load_server_module()
         captured = {}
@@ -352,6 +376,29 @@ class TestAskEndpoint:
 
 
 class TestSessionEndpoints:
+    def test_cancel_handles_success_and_missing_session(self):
+        module = load_server_module()
+        module._active_sessions["sess-1"] = asyncio.Event()
+
+        response = run(module.cancel(module.CancelRequest(session_id="sess-1")))
+        body = json.loads(response.body)
+
+        assert response.status_code == 200
+        assert body["status"] == "cancelled"
+        assert module._active_sessions["sess-1"].is_set() is True
+
+        missing = run(module.cancel(module.CancelRequest(session_id="sess-2")))
+        assert missing.status_code == 404
+
+    def test_health_reports_service_metadata(self):
+        module = load_server_module()
+
+        body = run(module.health())
+
+        assert body["status"] == "ok"
+        assert body["service"] == "zo-hermes"
+        assert body["version"] == "0.1.0"
+
     def test_clarify_response_handles_missing_and_success(self):
         module = load_server_module()
         missing = run(module.clarify_response(module.ClarifyResponse(session_id="sess-1", response="A")))
@@ -509,3 +556,142 @@ class TestSessionEndpoints:
         assert body["previous_session_id"] == "sess-1"
         assert body["before"]["messages"] == 4
         assert body["after"]["messages"] == 2
+
+
+class TestStreamingAndAgentBehavior:
+    def test_non_streaming_returns_updated_conversation_header(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {"final_response": "done", "_session_id": "sess-2"}
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                asyncio.Event(),
+            )
+        )
+
+        body = json.loads(response.body)
+        assert body["conversation_id"] == "sess-2"
+        assert response.headers["X-Conversation-Id"] == "sess-2"
+
+    def test_streaming_emits_thinking_text_clarify_and_end_events(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(
+            user_message,
+            session_id,
+            model,
+            max_iterations,
+            cancel_event,
+            loop,
+            thinking_queue=None,
+            message_queue=None,
+            clarify_queue=None,
+            **kwargs,
+        ):
+            loop.call_soon_threadsafe(
+                thinking_queue.put_nowait, ("thinking", "Plan the answer")
+            )
+            loop.call_soon_threadsafe(
+                message_queue.put_nowait, ("message", "Hello ")
+            )
+            loop.call_soon_threadsafe(
+                message_queue.put_nowait, ("message", "world")
+            )
+            loop.call_soon_threadsafe(
+                clarify_queue.put_nowait,
+                ("clarify", {"question": "Pick one", "choices": ["A", "B"]}),
+            )
+            return {"final_response": "Hello world", "_session_id": "sess-2"}
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                asyncio.Event(),
+            )
+        )
+        chunks = run(collect_stream(response))
+        stream = "".join(chunks)
+
+        assert response.headers["X-Conversation-Id"] == "sess-1"
+        assert 'event: PartStartEvent\ndata: {"part": {"part_kind": "thinking", "content": "Plan the answer"}}' in stream
+        assert 'event: PartDeltaEvent\ndata: {"delta": {"part_delta_kind": "text", "content_delta": "Hello "}}' in stream
+        assert 'event: ClarifyEvent\ndata: {"question": "Pick one", "choices": ["A", "B"], "session_id": "sess-1"}' in stream
+        assert 'event: End\ndata: {"data": {"output": "Hello world", "conversation_id": "sess-2"}}' in stream
+
+    def test_streaming_emits_error_event_on_failure(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                asyncio.Event(),
+            )
+        )
+        stream = "".join(run(collect_stream(response)))
+
+        assert 'event: SSEErrorEvent\ndata: {"message": "boom"}' in stream
+
+    def test_run_agent_sync_deduplicates_reasoning_and_passes_overlay_separately(self):
+        module = load_server_module()
+        captured = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                self.session_id = kwargs["session_id"]
+
+            def run_conversation(self, **kwargs):
+                captured["user_message"] = kwargs["user_message"]
+                reasoning_cb = captured["kwargs"]["reasoning_callback"]
+                part_one = "Plan the answer carefully with detailed"
+                part_two = " steps and reflect before replying."
+                full_text = part_one + part_two
+                reasoning_cb(part_one)
+                reasoning_cb(part_two)
+                reasoning_cb(full_text)
+                return {"final_response": "ok"}
+
+        module.AIAgent = RecordingAgent
+        thinking_queue = asyncio.Queue()
+
+        result = module._run_agent_sync(
+            "Original prompt",
+            "sess-1",
+            "gpt-5.4",
+            5,
+            asyncio.Event(),
+            SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
+            thinking_queue=thinking_queue,
+            ephemeral_system_prompt="## Message Source\nDiscord context",
+        )
+
+        queued = []
+        while not thinking_queue.empty():
+            queued.append(thinking_queue.get_nowait())
+
+        assert result["_session_id"] == "sess-1"
+        assert captured["kwargs"]["pass_session_id"] is True
+        assert captured["user_message"] == "Original prompt"
+        assert captured["kwargs"]["ephemeral_system_prompt"] == "## Message Source\nDiscord context"
+        assert queued == [("thinking", "Plan the answer carefully with detailed steps and reflect before replying.")]
