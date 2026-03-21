@@ -57,9 +57,13 @@ def load_server_module():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.session_id = kwargs["session_id"]
+            self.interrupt_calls = []
 
         def run_conversation(self, **kwargs):
             return {"final_response": "ok"}
+
+        def interrupt(self, message):
+            self.interrupt_calls.append(message)
 
     fake_run_agent.AIAgent = FakeAIAgent
 
@@ -85,6 +89,16 @@ def load_server_module():
         }
     }
     fake_model_tools = types.ModuleType("model_tools")
+    fake_agent_parent = types.ModuleType("agent")
+    fake_prompt_builder = types.ModuleType("agent.prompt_builder")
+    fake_prompt_builder._scan_context_content = lambda content, _path: content
+    fake_prompt_builder._truncate_content = lambda content, _label: content
+    fake_prompt_builder._find_hermes_md = lambda _cwd: None
+    fake_prompt_builder._strip_yaml_frontmatter = lambda content: content
+    fake_prompt_builder.load_soul_md = lambda: ""
+    fake_context_compressor = types.ModuleType("agent.context_compressor")
+    fake_context_compressor.LEGACY_SUMMARY_PREFIX = "[legacy-summary]"
+    fake_context_compressor.SUMMARY_PREFIX = "[summary]"
 
     def fake_get_tool_definitions(enabled_toolsets=None, disabled_toolsets=None, quiet_mode=False):
         if enabled_toolsets is None:
@@ -180,6 +194,9 @@ def load_server_module():
     sys.modules["hermes_cli.config"] = fake_config
     sys.modules["hermes_cli.runtime_provider"] = fake_runtime
     sys.modules["model_tools"] = fake_model_tools
+    sys.modules["agent"] = fake_agent_parent
+    sys.modules["agent.prompt_builder"] = fake_prompt_builder
+    sys.modules["agent.context_compressor"] = fake_context_compressor
     sys.modules["fastapi"] = fake_fastapi
     sys.modules["fastapi.responses"] = fake_fastapi_responses
     sys.modules["pydantic"] = fake_pydantic
@@ -257,6 +274,14 @@ class TestZoMcpConfigExpansion:
 
 
 class TestAskEndpoint:
+    def test_resolve_model_returns_fallback_message_for_byok(self):
+        module = load_server_module()
+
+        model, fallback = module._resolve_model("byok:test-model")
+
+        assert model == module.DEFAULT_MODEL
+        assert "falling back" in fallback
+
     def test_ask_ignores_byok_model_ids_and_uses_default_model(self):
         module = load_server_module()
         captured = {}
@@ -378,14 +403,20 @@ class TestAskEndpoint:
 class TestSessionEndpoints:
     def test_cancel_handles_success_and_missing_session(self):
         module = load_server_module()
-        module._active_sessions["sess-1"] = asyncio.Event()
+        active = module.ActiveSession(
+            cancel_event=__import__("threading").Event(),
+            root_session_id="sess-1",
+            current_session_id="sess-1",
+            aliases={"sess-1"},
+        )
+        module._active_sessions["sess-1"] = active
 
         response = run(module.cancel(module.CancelRequest(session_id="sess-1")))
         body = json.loads(response.body)
 
         assert response.status_code == 200
         assert body["status"] == "cancelled"
-        assert module._active_sessions["sess-1"].is_set() is True
+        assert module._active_sessions["sess-1"].cancel_event.is_set() is True
 
         missing = run(module.cancel(module.CancelRequest(session_id="sess-2")))
         assert missing.status_code == 404
@@ -437,7 +468,12 @@ class TestSessionEndpoints:
 
     def test_status_returns_live_agent_details(self):
         module = load_server_module()
-        module._active_sessions["sess-1"] = asyncio.Event()
+        module._active_sessions["sess-1"] = module.ActiveSession(
+            cancel_event=__import__("threading").Event(),
+            root_session_id="sess-1",
+            current_session_id="sess-1",
+            aliases={"sess-1"},
+        )
         module._session_agents["sess-1"] = SimpleNamespace(
             iteration_budget=SimpleNamespace(_used=2, max_total=7),
             model="gpt-5.4",
@@ -559,6 +595,30 @@ class TestSessionEndpoints:
 
 
 class TestStreamingAndAgentBehavior:
+    def test_non_streaming_includes_model_fallback_header_and_body(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {"final_response": "done", "_session_id": "sess-1"}
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+                model_fallback="Hermes cannot use requested model byok:test; falling back to gpt-5.4.",
+            )
+        )
+
+        body = json.loads(response.body)
+        assert body["model_fallback"].startswith("Hermes cannot use requested model")
+        assert response.headers["X-Model-Fallback"].startswith("Hermes cannot use requested model")
+
     def test_non_streaming_returns_updated_conversation_header(self):
         module = load_server_module()
 
@@ -573,7 +633,8 @@ class TestStreamingAndAgentBehavior:
                 "sess-1",
                 "gpt-5.4",
                 5,
-                asyncio.Event(),
+                __import__("threading").Event(),
+                None,
             )
         )
 
@@ -590,6 +651,7 @@ class TestStreamingAndAgentBehavior:
             model,
             max_iterations,
             cancel_event,
+            active_session,
             loop,
             thinking_queue=None,
             message_queue=None,
@@ -619,7 +681,8 @@ class TestStreamingAndAgentBehavior:
                 "sess-1",
                 "gpt-5.4",
                 5,
-                asyncio.Event(),
+                __import__("threading").Event(),
+                None,
             )
         )
         chunks = run(collect_stream(response))
@@ -645,12 +708,30 @@ class TestStreamingAndAgentBehavior:
                 "sess-1",
                 "gpt-5.4",
                 5,
-                asyncio.Event(),
+                __import__("threading").Event(),
+                None,
             )
         )
         stream = "".join(run(collect_stream(response)))
 
         assert 'event: SSEErrorEvent\ndata: {"message": "boom"}' in stream
+
+    def test_streaming_ask_keeps_session_active_until_stream_finishes(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {"final_response": "done", "_session_id": "sess-1"}
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(module.ask(module.AskRequest(input="hello", stream=True, conversation_id="sess-1")))
+
+        assert "sess-1" in module._active_sessions
+
+        stream = "".join(run(collect_stream(response)))
+
+        assert 'event: End\ndata: {"data": {"output": "done", "conversation_id": "sess-1"}}' in stream
+        assert "sess-1" not in module._active_sessions
 
     def test_run_agent_sync_deduplicates_reasoning_and_passes_overlay_separately(self):
         module = load_server_module()
@@ -673,25 +754,69 @@ class TestStreamingAndAgentBehavior:
                 return {"final_response": "ok"}
 
         module.AIAgent = RecordingAgent
-        thinking_queue = asyncio.Queue()
+        queued = []
+        thinking_queue = SimpleNamespace(put_nowait=queued.append)
 
         result = module._run_agent_sync(
             "Original prompt",
             "sess-1",
             "gpt-5.4",
             5,
-            asyncio.Event(),
+            __import__("threading").Event(),
+            None,
             SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
             thinking_queue=thinking_queue,
             ephemeral_system_prompt="## Message Source\nDiscord context",
         )
-
-        queued = []
-        while not thinking_queue.empty():
-            queued.append(thinking_queue.get_nowait())
 
         assert result["_session_id"] == "sess-1"
         assert captured["kwargs"]["pass_session_id"] is True
         assert captured["user_message"] == "Original prompt"
         assert captured["kwargs"]["ephemeral_system_prompt"] == "## Message Source\nDiscord context"
         assert queued == [("thinking", "Plan the answer carefully with detailed steps and reflect before replying.")]
+
+    def test_run_agent_sync_interrupts_agent_when_cancel_event_is_set(self):
+        module = load_server_module()
+        interrupted = __import__("threading").Event()
+
+        class InterruptibleAgent:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs["session_id"]
+
+            def interrupt(self, message):
+                interrupted.set()
+
+            def run_conversation(self, **kwargs):
+                for _ in range(50):
+                    if interrupted.is_set():
+                        return {"final_response": "[interrupted]"}
+                    __import__("time").sleep(0.01)
+                return {"final_response": "ok"}
+
+        module.AIAgent = InterruptibleAgent
+        cancel_event = __import__("threading").Event()
+
+        async def trigger_cancel():
+            await asyncio.sleep(0.05)
+            cancel_event.set()
+
+        async def exercise():
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(trigger_cancel())
+            return await loop.run_in_executor(
+                None,
+                lambda: module._run_agent_sync(
+                    "hello",
+                    "sess-1",
+                    "gpt-5.4",
+                    5,
+                    cancel_event,
+                    None,
+                    loop,
+                ),
+            )
+
+        result = run(exercise())
+
+        assert interrupted.is_set() is True
+        assert result["final_response"] == "[interrupted]"

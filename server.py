@@ -97,9 +97,12 @@ def _apply_default_zo_mcp_policy(cfg):
 hermes_config.load_config = _load_config_with_expanded_env
 
 from model_tools import get_tool_definitions as _get_tool_definitions  # noqa: E402
+import run_agent as _run_agent_module  # noqa: E402
 from run_agent import AIAgent  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
+from agent import prompt_builder as _prompt_builder  # noqa: E402
+from agent.context_compressor import LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -117,11 +120,22 @@ PORT = int(os.getenv("HERMES_API_PORT", "8788"))
 DEFAULT_MODEL = os.getenv("HERMES_DEFAULT_MODEL", "gpt-5.4")
 DEFAULT_MAX_ITERATIONS = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
+SESSION_FILES_DIR = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "sessions"
+
 
 # ---------------------------------------------------------------------------
 # Session tracking — active sessions that can be cancelled
 # ---------------------------------------------------------------------------
-_active_sessions: dict[str, asyncio.Event] = {}  # session_id -> cancel_event
+@dataclass
+class ActiveSession:
+    cancel_event: threading.Event
+    root_session_id: str
+    current_session_id: str
+    aliases: set[str] = field(default_factory=set)
+
+
+_session_tracking_lock = threading.Lock()
+_active_sessions: dict[str, ActiveSession] = {}  # any known session_id -> active session
 _session_agents: dict[str, "AIAgent"] = {}  # session_id -> last AIAgent instance
 _session_db: Optional[SessionDB] = None
 
@@ -141,6 +155,242 @@ def _generate_session_id() -> str:
     now = time.strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
     return f"{now}_{suffix}"
+
+
+def _register_active_session(session_id: str, cancel_event: threading.Event) -> ActiveSession:
+    active = ActiveSession(
+        cancel_event=cancel_event,
+        root_session_id=session_id,
+        current_session_id=session_id,
+        aliases={session_id},
+    )
+    with _session_tracking_lock:
+        _active_sessions[session_id] = active
+    return active
+
+
+def _register_session_alias(active: ActiveSession, session_id: str) -> None:
+    if not session_id:
+        return
+    with _session_tracking_lock:
+        active.current_session_id = session_id
+        active.aliases.add(session_id)
+        for alias in active.aliases:
+            _active_sessions[alias] = active
+
+
+def _resolve_active_session(session_id: str) -> Optional[ActiveSession]:
+    with _session_tracking_lock:
+        active = _active_sessions.get(session_id)
+    if active and not isinstance(active, ActiveSession):
+        wrapped = ActiveSession(
+            cancel_event=active,
+            root_session_id=session_id,
+            current_session_id=session_id,
+            aliases={session_id},
+        )
+        with _session_tracking_lock:
+            _active_sessions[session_id] = wrapped
+        return wrapped
+    return active
+
+
+def _resolve_session_id(session_id: str) -> str:
+    active = _resolve_active_session(session_id)
+    return active.current_session_id if active else session_id
+
+
+def _unregister_active_session(active: ActiveSession) -> None:
+    with _session_tracking_lock:
+        for alias in list(active.aliases):
+            existing = _active_sessions.get(alias)
+            if existing is active:
+                _active_sessions.pop(alias, None)
+
+
+def _session_file_path(session_id: str) -> Path:
+    return SESSION_FILES_DIR / f"session_{session_id}.json"
+
+
+def _load_session_file_messages(session_id: str) -> List[dict]:
+    path = _session_file_path(session_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to read session file for %s: %s", session_id, e)
+        return []
+    messages = data.get("messages")
+    return list(messages) if isinstance(messages, list) else []
+
+
+def _write_session_file_messages(session_id: str, messages: List[dict]) -> None:
+    path = _session_file_path(session_id)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load session file for rewrite %s: %s", session_id, e)
+        return
+    data["messages"] = messages
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _load_db_messages(session_id: str) -> List[dict]:
+    try:
+        return _get_session_db().get_messages_as_conversation(session_id)
+    except Exception:
+        return []
+
+
+def _normalize_message(msg: dict) -> dict:
+    normalized = {"role": msg.get("role", "unknown"), "content": msg.get("content")}
+    for key in ("tool_name", "tool_calls", "tool_call_id"):
+        if msg.get(key) is not None:
+            normalized[key] = msg.get(key)
+    return normalized
+
+
+def _candidate_history_sort_key(source: str, messages: List[dict]) -> tuple[int, int]:
+    source_priority = {"agent": 3, "db": 2, "file": 1}.get(source, 0)
+    return (len(messages), source_priority)
+
+
+def _load_best_history(session_id: str) -> tuple[str, List[dict]]:
+    canonical_id = _resolve_session_id(session_id)
+    candidate_ids = list(dict.fromkeys([canonical_id, session_id]))
+    candidates: List[tuple[str, List[dict]]] = []
+
+    agent = _session_agents.get(canonical_id) or _session_agents.get(session_id)
+    history = getattr(agent, "conversation_history", None) if agent else None
+    if history:
+        candidates.append(("agent", [_normalize_message(msg) for msg in history]))
+
+    for candidate_id in candidate_ids:
+        db_messages = [_normalize_message(msg) for msg in _load_db_messages(candidate_id)]
+        if db_messages:
+            candidates.append(("db", db_messages))
+        file_messages = [_normalize_message(msg) for msg in _load_session_file_messages(candidate_id)]
+        if file_messages:
+            candidates.append(("file", file_messages))
+
+    if not candidates:
+        return canonical_id, []
+
+    source, messages = max(candidates, key=lambda item: _candidate_history_sort_key(item[0], item[1]))
+    logger.info("Resolved history for %s via %s (%d messages)", canonical_id, source, len(messages))
+    return canonical_id, messages
+
+
+def _rewrite_session_history(session_id: str, messages: List[dict]) -> None:
+    session_db = _get_session_db()
+    session_db.clear_messages(session_id)
+    for msg in messages:
+        session_db.append_message(
+            session_id=session_id,
+            role=msg.get("role", "unknown"),
+            content=msg.get("content"),
+            tool_name=msg.get("tool_name"),
+            tool_calls=msg.get("tool_calls"),
+            tool_call_id=msg.get("tool_call_id"),
+        )
+    _write_session_file_messages(session_id, messages)
+
+
+def _has_compaction_summary(messages: List[dict]) -> bool:
+    for msg in messages:
+        content = (msg.get("content") or "").strip()
+        if content.startswith(SUMMARY_PREFIX) or content.startswith(LEGACY_SUMMARY_PREFIX):
+            return True
+    return False
+
+
+def _truncate_summary_text(text: str, limit: int = 220) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _build_fallback_compaction_summary(messages: List[dict]) -> Optional[str]:
+    if not messages:
+        return None
+
+    bullets = []
+    current_user = None
+    current_tool_names: List[str] = []
+    current_assistant = None
+
+    def flush_current():
+        if current_user is None and current_assistant is None:
+            return
+        bullet = []
+        if current_user:
+            bullet.append(f"User asked: {_truncate_summary_text(current_user)}")
+        if current_tool_names:
+            bullet.append(f"Tools used: {', '.join(dict.fromkeys(current_tool_names))}")
+        if current_assistant:
+            bullet.append(f"Outcome: {_truncate_summary_text(current_assistant)}")
+        if bullet:
+            bullets.append("- " + " | ".join(bullet))
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            flush_current()
+            current_user = msg.get("content") or ""
+            current_tool_names = []
+            current_assistant = None
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                for tool_call in tool_calls:
+                    if isinstance(tool_call, dict):
+                        name = (tool_call.get("function") or {}).get("name")
+                        if name:
+                            current_tool_names.append(name)
+            content = (msg.get("content") or "").strip()
+            if content:
+                current_assistant = content
+        elif role == "tool":
+            tool_name = msg.get("tool_name")
+            if tool_name:
+                current_tool_names.append(tool_name)
+
+    flush_current()
+    if not bullets:
+        return None
+    return f"{SUMMARY_PREFIX}\n" + "\n".join(bullets[:8])
+
+
+def _ensure_compaction_summary(session_id: str, source_messages: List[dict]) -> bool:
+    if not source_messages:
+        return False
+
+    current_messages = _load_db_messages(session_id)
+    if not current_messages:
+        current_messages = _load_session_file_messages(session_id)
+    if not current_messages or _has_compaction_summary(current_messages):
+        return False
+
+    summary = _build_fallback_compaction_summary(source_messages)
+    if not summary:
+        return False
+
+    summary_role = "assistant"
+    first_role = current_messages[0].get("role")
+    if first_role == "assistant":
+        summary_role = "user"
+
+    rewritten = [{"role": summary_role, "content": summary}, *current_messages]
+    _rewrite_session_history(session_id, rewritten)
+    agent = _session_agents.get(session_id)
+    if agent and hasattr(agent, "conversation_history"):
+        agent.conversation_history = rewritten
+    logger.info("Injected fallback compaction summary into session %s", session_id)
+    return True
 
 
 def _is_enabled_flag(value) -> bool:
@@ -201,6 +451,15 @@ def _validate_enabled_toolsets(enabled_toolsets: Optional[List[str]]) -> Optiona
     return normalized
 
 
+def _resolve_model(requested_model: Optional[str]) -> tuple[str, Optional[str]]:
+    if requested_model and requested_model.startswith("byok:"):
+        return (
+            DEFAULT_MODEL,
+            f"Hermes cannot use requested model {requested_model}; falling back to {DEFAULT_MODEL}.",
+        )
+    return requested_model or DEFAULT_MODEL, None
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -242,8 +501,9 @@ def _run_agent_sync(
     session_id: str,
     model: str,
     max_iterations: int,
-    cancel_event: asyncio.Event,
-    loop: asyncio.AbstractEventLoop,
+    cancel_event: threading.Event,
+    active_session: Optional[ActiveSession] = None,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
     thinking_queue: Optional[asyncio.Queue] = None,
     message_queue: Optional[asyncio.Queue] = None,
     clarify_queue: Optional[asyncio.Queue] = None,
@@ -259,16 +519,16 @@ def _run_agent_sync(
     Returns the result dict from run_conversation(), plus the agent's
     potentially-updated session_id (changes after context compression).
     """
+    if loop is None:
+        raise ValueError("loop is required")
+
     session_db = _get_session_db()
 
     # Load conversation history if continuing a session
     conversation_history = None
-    try:
-        history = session_db.get_messages_as_conversation(session_id)
-        if history:
-            conversation_history = history
-    except Exception:
-        pass  # New session, no history
+    _, history = _load_best_history(session_id)
+    if history:
+        conversation_history = history
 
     # reasoning_callback: Hermes calls this from TWO code paths per block:
     #   1. _fire_reasoning_delta — per-token streaming deltas (small fragments)
@@ -366,6 +626,17 @@ def _run_agent_sync(
     agent = AIAgent(**agent_kwargs)
     _session_agents[session_id] = agent
 
+    # Translate API-level cancel requests into Hermes' native interrupt path.
+    def _watch_for_cancel() -> None:
+        cancel_event.wait()
+        try:
+            agent.interrupt("Interrupted by a newer Discord message.")
+        except Exception:
+            logger.exception("Failed to interrupt agent for session %s", session_id)
+
+    cancel_watcher = threading.Thread(target=_watch_for_cancel, daemon=True)
+    cancel_watcher.start()
+
     # Change CWD for file access parity with Zo.
     original_cwd = os.getcwd()
     try:
@@ -390,6 +661,9 @@ def _run_agent_sync(
     if effective_id != session_id:
         _session_agents[effective_id] = agent
         _session_agents.pop(session_id, None)
+        if active_session is not None:
+            _register_session_alias(active_session, effective_id)
+        _ensure_compaction_summary(effective_id, conversation_history or [])
     result["_session_id"] = effective_id
     return result
 
@@ -425,8 +699,7 @@ async def ask(req: AskRequest):
     Supports both streaming (SSE) and non-streaming (JSON) modes.
     """
     session_id = req.session_id or _generate_session_id()
-    # Ignore Zo BYOK model IDs (e.g. "byok:xxx") — use default Hermes model instead
-    model = req.model_name if req.model_name and not req.model_name.startswith("byok:") else DEFAULT_MODEL
+    model, model_fallback = _resolve_model(req.model_name)
     max_iterations = req.max_iterations or DEFAULT_MAX_ITERATIONS
     reasoning_effort = req.reasoning_effort
     skip_memory = req.skip_memory or False
@@ -442,28 +715,31 @@ async def ask(req: AskRequest):
     disabled_toolsets = req.disabled_toolsets
 
     # Register cancel event
-    cancel_event = asyncio.Event()
-    _active_sessions[session_id] = cancel_event
+    cancel_event = threading.Event()
+    active_session = _register_active_session(session_id, cancel_event)
 
-    try:
-        if req.stream:
+    if req.stream:
+        try:
             return await _handle_streaming(
                 req.input, session_id, model, max_iterations, cancel_event,
+                active_session,
                 ephemeral_system_prompt=req.ephemeral_system_prompt,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
+                disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
             )
-        else:
-            return await _handle_non_streaming(
-                req.input, session_id, model, max_iterations, cancel_event,
-                ephemeral_system_prompt=req.ephemeral_system_prompt,
-                reasoning_effort=reasoning_effort, skip_memory=skip_memory,
-                skip_context=skip_context, enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-            )
-    finally:
-        _active_sessions.pop(session_id, None)
+        except Exception:
+            _unregister_active_session(active_session)
+            raise
+
+    return await _handle_non_streaming(
+        req.input, session_id, model, max_iterations, cancel_event,
+        active_session,
+        ephemeral_system_prompt=req.ephemeral_system_prompt,
+        reasoning_effort=reasoning_effort, skip_memory=skip_memory,
+        skip_context=skip_context, enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
+    )
 
 
 async def _handle_non_streaming(
@@ -471,13 +747,15 @@ async def _handle_non_streaming(
     session_id: str,
     model: str,
     max_iterations: int,
-    cancel_event: asyncio.Event,
+    cancel_event: threading.Event,
+    active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    model_fallback: Optional[str] = None,
 ) -> JSONResponse:
     """Non-streaming mode for zo-dispatcher: returns JSON with output + conversation_id."""
     loop = asyncio.get_event_loop()
@@ -486,8 +764,15 @@ async def _handle_non_streaming(
         result = await loop.run_in_executor(
             None,
             lambda: _run_agent_sync(
-                user_message, session_id, model, max_iterations,
-                cancel_event, loop, None, None,
+                user_message,
+                session_id,
+                model,
+                max_iterations,
+                cancel_event,
+                active_session=active_session,
+                loop=loop,
+                thinking_queue=None,
+                message_queue=None,
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
@@ -497,9 +782,16 @@ async def _handle_non_streaming(
 
         output = result.get("final_response", "")
         effective_session_id = result.get("_session_id", session_id)
+        headers = {"X-Conversation-Id": effective_session_id}
+        if model_fallback:
+            headers["X-Model-Fallback"] = model_fallback
         return JSONResponse(
-            content={"output": output, "conversation_id": effective_session_id},
-            headers={"X-Conversation-Id": effective_session_id},
+            content={
+                "output": output,
+                "conversation_id": effective_session_id,
+                "model_fallback": model_fallback,
+            },
+            headers=headers,
         )
 
     except Exception as e:
@@ -508,6 +800,9 @@ async def _handle_non_streaming(
             status_code=500,
             content={"error": str(e), "conversation_id": session_id},
         )
+    finally:
+        if active_session is not None:
+            _unregister_active_session(active_session)
 
 
 async def _handle_streaming(
@@ -515,13 +810,15 @@ async def _handle_streaming(
     session_id: str,
     model: str,
     max_iterations: int,
-    cancel_event: asyncio.Event,
+    cancel_event: threading.Event,
+    active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    model_fallback: Optional[str] = None,
 ) -> StreamingResponse:
     """Streaming mode for zo-discord: returns SSE with Zo-compatible events."""
     loop = asyncio.get_event_loop()
@@ -533,8 +830,15 @@ async def _handle_streaming(
     agent_task = loop.run_in_executor(
         None,
         lambda: _run_agent_sync(
-            user_message, session_id, model, max_iterations,
-            cancel_event, loop, thinking_queue, message_queue,
+            user_message,
+            session_id,
+            model,
+            max_iterations,
+            cancel_event,
+            active_session=active_session,
+            loop=loop,
+            thinking_queue=thinking_queue,
+            message_queue=message_queue,
             clarify_queue=clarify_queue,
             ephemeral_system_prompt=ephemeral_system_prompt,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
@@ -649,12 +953,16 @@ async def _handle_streaming(
         except Exception as e:
             logger.exception("Error in SSE stream for session %s", session_id)
             yield _sse_event("SSEErrorEvent", {"message": str(e)})
+        finally:
+            if active_session is not None:
+                _unregister_active_session(active_session)
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "X-Conversation-Id": session_id,
+            **({"X-Model-Fallback": model_fallback} if model_fallback else {}),
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         },
@@ -664,10 +972,10 @@ async def _handle_streaming(
 @app.post("/cancel")
 async def cancel(req: CancelRequest):
     """Cancel an in-flight session."""
-    cancel_event = _active_sessions.get(req.session_id)
-    if cancel_event:
-        cancel_event.set()
-        return JSONResponse(content={"status": "cancelled", "session_id": req.session_id})
+    active = _resolve_active_session(req.session_id)
+    if active:
+        active.cancel_event.set()
+        return JSONResponse(content={"status": "cancelled", "session_id": active.current_session_id})
     return JSONResponse(
         status_code=404,
         content={"error": "Session not found or already completed", "session_id": req.session_id},
@@ -700,12 +1008,7 @@ async def health():
 @app.post("/undo")
 async def undo(req: SessionRequest):
     """Remove the last user+assistant exchange from a session's transcript."""
-    session_db = _get_session_db()
-    try:
-        messages = session_db.get_messages_as_conversation(req.session_id)
-    except Exception as e:
-        return JSONResponse(status_code=404, content={"error": f"Session not found: {e}"})
-
+    resolved_session_id, messages = _load_best_history(req.session_id)
     if not messages:
         return JSONResponse(status_code=400, content={"error": "No messages in session"})
 
@@ -722,26 +1025,17 @@ async def undo(req: SessionRequest):
     removed = messages[last_user_idx:]
     remaining = messages[:last_user_idx]
 
-    # Rewrite transcript: clear and re-insert remaining messages
-    session_db.clear_messages(req.session_id)
-    for msg in remaining:
-        session_db.append_message(
-            session_id=req.session_id,
-            role=msg.get("role", "unknown"),
-            content=msg.get("content"),
-            tool_name=msg.get("tool_name"),
-            tool_calls=msg.get("tool_calls"),
-            tool_call_id=msg.get("tool_call_id"),
-        )
+    _rewrite_session_history(resolved_session_id, remaining)
 
     # Also update in-memory agent history if we have one
-    agent = _session_agents.get(req.session_id)
+    agent = _session_agents.get(resolved_session_id)
     if agent and hasattr(agent, "conversation_history"):
         agent.conversation_history = remaining
 
     return JSONResponse(content={
         "status": "undone",
-        "session_id": req.session_id,
+        "session_id": resolved_session_id,
+        "requested_session_id": req.session_id,
         "removed_count": len(removed),
         "remaining_count": len(remaining),
         "removed_messages": [
@@ -754,11 +1048,13 @@ async def undo(req: SessionRequest):
 @app.get("/status")
 async def status(session_id: str):
     """Return running/idle state and agent info for a session."""
-    is_running = session_id in _active_sessions
-    agent = _session_agents.get(session_id)
+    resolved_session_id = _resolve_session_id(session_id)
+    is_running = _resolve_active_session(session_id) is not None
+    agent = _session_agents.get(resolved_session_id) or _session_agents.get(session_id)
 
     result = {
-        "session_id": session_id,
+        "session_id": resolved_session_id,
+        "requested_session_id": session_id,
         "state": "running" if is_running else "idle",
     }
 
@@ -772,14 +1068,10 @@ async def status(session_id: str):
         result["api_calls"] = getattr(agent, "session_api_calls", 0) or 0
     else:
         # No agent instance — check if session exists in DB at all
-        session_db = _get_session_db()
-        try:
-            messages = session_db.get_messages_as_conversation(session_id)
-            if not messages:
-                return JSONResponse(status_code=404, content={"error": "Session not found"})
-            result["message_count"] = len(messages)
-        except Exception:
+        messages = _load_db_messages(resolved_session_id) or _load_session_file_messages(resolved_session_id)
+        if not messages:
             return JSONResponse(status_code=404, content={"error": "Session not found"})
+        result["message_count"] = len(messages)
 
     return JSONResponse(content=result)
 
@@ -787,29 +1079,26 @@ async def status(session_id: str):
 @app.get("/usage")
 async def usage(session_id: str):
     """Return token usage details for a session."""
-    agent = _session_agents.get(session_id)
+    resolved_session_id = _resolve_session_id(session_id)
+    agent = _session_agents.get(resolved_session_id) or _session_agents.get(session_id)
 
     if not agent:
         # No agent — return minimal info from DB
-        session_db = _get_session_db()
-        try:
-            messages = session_db.get_messages_as_conversation(session_id)
-            if not messages:
-                return JSONResponse(status_code=404, content={"error": "Session not found"})
-            # Estimate tokens from messages
-            try:
-                from agent.model_metadata import estimate_messages_tokens_rough
-                approx_tokens = estimate_messages_tokens_rough(messages)
-            except Exception:
-                approx_tokens = None
-            return JSONResponse(content={
-                "session_id": session_id,
-                "message_count": len(messages),
-                "estimated_context_tokens": approx_tokens,
-                "note": "No active agent — showing estimates only",
-            })
-        except Exception:
+        messages = _load_db_messages(resolved_session_id) or _load_session_file_messages(resolved_session_id)
+        if not messages:
             return JSONResponse(status_code=404, content={"error": "Session not found"})
+        try:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            approx_tokens = estimate_messages_tokens_rough(messages)
+        except Exception:
+            approx_tokens = None
+        return JSONResponse(content={
+            "session_id": resolved_session_id,
+            "requested_session_id": session_id,
+            "message_count": len(messages),
+            "estimated_context_tokens": approx_tokens,
+            "note": "No active agent — showing estimates only",
+        })
 
     input_tokens = getattr(agent, "session_input_tokens", 0) or 0
     output_tokens = getattr(agent, "session_output_tokens", 0) or 0
@@ -846,7 +1135,8 @@ async def usage(session_id: str):
         pass
 
     return JSONResponse(content={
-        "session_id": session_id,
+        "session_id": resolved_session_id,
+        "requested_session_id": session_id,
         "model": agent.model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -867,7 +1157,8 @@ async def usage(session_id: str):
 @app.post("/compress")
 async def compress(req: SessionRequest):
     """Compress context for a session — flushes memories and summarizes middle turns."""
-    agent = _session_agents.get(req.session_id)
+    resolved_session_id = _resolve_session_id(req.session_id)
+    agent = _session_agents.get(resolved_session_id) or _session_agents.get(req.session_id)
     if not agent:
         return JSONResponse(status_code=404, content={
             "error": "No active agent for this session. Send a message first via /ask.",
@@ -878,7 +1169,7 @@ async def compress(req: SessionRequest):
 
     session_db = _get_session_db()
     try:
-        messages = session_db.get_messages_as_conversation(req.session_id)
+        messages = session_db.get_messages_as_conversation(resolved_session_id)
     except Exception:
         messages = getattr(agent, "conversation_history", None) or []
 
@@ -903,20 +1194,25 @@ async def compress(req: SessionRequest):
 
         # The agent's session_id may have changed after compression
         new_session_id = agent.session_id
-        if new_session_id != req.session_id:
+        if new_session_id != resolved_session_id:
             _session_agents[new_session_id] = agent
-            _session_agents.pop(req.session_id, None)
+            _session_agents.pop(resolved_session_id, None)
+            active = _resolve_active_session(req.session_id)
+            if active:
+                _register_session_alias(active, new_session_id)
+            _ensure_compaction_summary(new_session_id, messages)
 
         return JSONResponse(content={
             "status": "compressed",
             "session_id": new_session_id,
-            "previous_session_id": req.session_id if new_session_id != req.session_id else None,
+            "requested_session_id": req.session_id,
+            "previous_session_id": resolved_session_id if new_session_id != resolved_session_id else None,
             "before": {"messages": before_count, "tokens": before_tokens},
             "after": {"messages": after_count, "tokens": after_tokens},
         })
 
     except Exception as e:
-        logger.exception("Compression failed for session %s", req.session_id)
+        logger.exception("Compression failed for session %s", resolved_session_id)
         return JSONResponse(status_code=500, content={"error": f"Compression failed: {e}"})
 
 
