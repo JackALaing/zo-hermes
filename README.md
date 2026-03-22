@@ -1,6 +1,6 @@
 # zo-hermes
 
-Thin FastAPI bridge that wraps the [Hermes AIAgent](file:///opt/hermes-agent/) and exposes it as a Zo-compatible API. This lets zo-discord (and anything else that speaks the Zo `/zo/ask` protocol) talk to a self-hosted Hermes agent instead of the Zo API.
+Thin FastAPI bridge that wraps the Hermes `AIAgent` and exposes it as a Zo-compatible API. This lets zo-discord (and anything else that speaks the Zo `/zo/ask` protocol) talk to a self-hosted Hermes agent instead of the Zo API.
 
 ## Why it exists
 
@@ -157,7 +157,7 @@ The `pass_session_id=True` flag is set so the agent can see its own session ID i
 
 ## Running
 
-Registered as a Zo user service (service ID: `svc_bInt4_9RgFI`). Managed via:
+Typically run as a Zo user service. Managed via:
 
 ```bash
 # The service runs start.sh, which:

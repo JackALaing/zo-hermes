@@ -314,6 +314,32 @@ def _truncate_summary_text(text: str, limit: int = 220) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _tool_call_name(tool_call: dict) -> Optional[str]:
+    if not isinstance(tool_call, dict):
+        return None
+    return (tool_call.get("function") or {}).get("name")
+
+
+def _build_summary_bullet(
+    current_user: Optional[str],
+    current_tool_names: List[str],
+    current_assistant: Optional[str],
+) -> Optional[str]:
+    if current_user is None and current_assistant is None:
+        return None
+
+    parts = []
+    if current_user:
+        parts.append(f"User asked: {_truncate_summary_text(current_user)}")
+    if current_tool_names:
+        parts.append(f"Tools used: {', '.join(dict.fromkeys(current_tool_names))}")
+    if current_assistant:
+        parts.append(f"Outcome: {_truncate_summary_text(current_assistant)}")
+    if not parts:
+        return None
+    return "- " + " | ".join(parts)
+
+
 def _build_fallback_compaction_summary(messages: List[dict]) -> Optional[str]:
     if not messages:
         return None
@@ -323,18 +349,10 @@ def _build_fallback_compaction_summary(messages: List[dict]) -> Optional[str]:
     current_tool_names: List[str] = []
     current_assistant = None
 
-    def flush_current():
-        if current_user is None and current_assistant is None:
-            return
-        bullet = []
-        if current_user:
-            bullet.append(f"User asked: {_truncate_summary_text(current_user)}")
-        if current_tool_names:
-            bullet.append(f"Tools used: {', '.join(dict.fromkeys(current_tool_names))}")
-        if current_assistant:
-            bullet.append(f"Outcome: {_truncate_summary_text(current_assistant)}")
+    def flush_current() -> None:
+        bullet = _build_summary_bullet(current_user, current_tool_names, current_assistant)
         if bullet:
-            bullets.append("- " + " | ".join(bullet))
+            bullets.append(bullet)
 
     for msg in messages:
         role = msg.get("role")
@@ -345,12 +363,10 @@ def _build_fallback_compaction_summary(messages: List[dict]) -> Optional[str]:
             current_assistant = None
         elif role == "assistant":
             tool_calls = msg.get("tool_calls") or []
-            if tool_calls:
-                for tool_call in tool_calls:
-                    if isinstance(tool_call, dict):
-                        name = (tool_call.get("function") or {}).get("name")
-                        if name:
-                            current_tool_names.append(name)
+            for tool_call in tool_calls:
+                name = _tool_call_name(tool_call)
+                if name:
+                    current_tool_names.append(name)
             content = (msg.get("content") or "").strip()
             if content:
                 current_assistant = content
