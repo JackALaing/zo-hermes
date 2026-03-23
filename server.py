@@ -476,6 +476,29 @@ def _resolve_model(requested_model: Optional[str]) -> tuple[str, Optional[str]]:
     return requested_model or DEFAULT_MODEL, None
 
 
+def _resolve_reasoning_config(requested_effort: Optional[str]) -> dict:
+    if requested_effort is not None:
+        return {"effort": requested_effort}
+
+    effort = ""
+    try:
+        cfg = hermes_config.load_config() or {}
+        effort = str(cfg.get("agent", {}).get("reasoning_effort", "") or "").strip().lower()
+    except Exception:
+        effort = ""
+
+    if effort == "none":
+        return {"enabled": False}
+
+    valid = {"xhigh", "high", "medium", "low", "minimal"}
+    if effort in valid:
+        return {"effort": effort}
+
+    if effort:
+        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+    return {"effort": "medium"}
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -628,7 +651,7 @@ def _run_agent_sync(
         save_trajectories=True,
         reasoning_callback=reasoning_cb,
         clarify_callback=clarify_cb,
-        reasoning_config={"effort": reasoning_effort or "medium"},
+        reasoning_config=_resolve_reasoning_config(reasoning_effort),
         pass_session_id=True,
         ephemeral_system_prompt=ephemeral_system_prompt,
         skip_memory=skip_memory,

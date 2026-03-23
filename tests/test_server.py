@@ -400,6 +400,26 @@ class TestAskEndpoint:
         assert "no configured MCP servers" in body["error"]
 
 
+class TestReasoningConfigResolution:
+    def test_explicit_request_effort_wins_over_config_default(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "low"}}
+
+        assert module._resolve_reasoning_config("high") == {"effort": "high"}
+
+    def test_omitted_request_effort_uses_config_default(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "low"}}
+
+        assert module._resolve_reasoning_config(None) == {"effort": "low"}
+
+    def test_missing_config_falls_back_to_medium(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {}
+
+        assert module._resolve_reasoning_config(None) == {"effort": "medium"}
+
+
 class TestSessionEndpoints:
     def test_cancel_handles_success_and_missing_session(self):
         module = load_server_module()
@@ -774,6 +794,36 @@ class TestStreamingAndAgentBehavior:
         assert captured["user_message"] == "Original prompt"
         assert captured["kwargs"]["ephemeral_system_prompt"] == "## Message Source\nDiscord context"
         assert queued == [("thinking", "Plan the answer carefully with detailed steps and reflect before replying.")]
+
+    def test_run_agent_sync_uses_config_reasoning_default_when_request_omitted(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "low"}}
+        captured = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                self.session_id = kwargs["session_id"]
+
+            def run_conversation(self, **kwargs):
+                return {"final_response": "ok"}
+
+            def interrupt(self, message):
+                pass
+
+        module.AIAgent = RecordingAgent
+
+        module._run_agent_sync(
+            "hello",
+            "sess-1",
+            "gpt-5.4",
+            5,
+            __import__("threading").Event(),
+            None,
+            SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
+        )
+
+        assert captured["kwargs"]["reasoning_config"] == {"effort": "low"}
 
     def test_run_agent_sync_interrupts_agent_when_cancel_event_is_set(self):
         module = load_server_module()
