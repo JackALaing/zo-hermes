@@ -478,7 +478,10 @@ def _resolve_model(requested_model: Optional[str]) -> tuple[str, Optional[str]]:
 
 def _resolve_reasoning_config(requested_effort: Optional[str]) -> dict:
     if requested_effort is not None:
-        return {"effort": requested_effort}
+        effort = str(requested_effort).strip().lower()
+        if effort == "none":
+            return {"enabled": False}
+        return {"effort": effort}
 
     effort = ""
     try:

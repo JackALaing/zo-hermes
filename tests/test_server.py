@@ -401,6 +401,12 @@ class TestAskEndpoint:
 
 
 class TestReasoningConfigResolution:
+    def test_explicit_request_none_disables_reasoning(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "high"}}
+
+        assert module._resolve_reasoning_config("none") == {"enabled": False}
+
     def test_explicit_request_effort_wins_over_config_default(self):
         module = load_server_module()
         module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "low"}}
@@ -412,6 +418,12 @@ class TestReasoningConfigResolution:
         module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "low"}}
 
         assert module._resolve_reasoning_config(None) == {"effort": "low"}
+
+    def test_omitted_request_effort_uses_config_none_to_disable_reasoning(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "none"}}
+
+        assert module._resolve_reasoning_config(None) == {"enabled": False}
 
     def test_missing_config_falls_back_to_medium(self):
         module = load_server_module()
@@ -824,6 +836,67 @@ class TestStreamingAndAgentBehavior:
         )
 
         assert captured["kwargs"]["reasoning_config"] == {"effort": "low"}
+
+    def test_run_agent_sync_disables_reasoning_for_explicit_request_none(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "high"}}
+        captured = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                self.session_id = kwargs["session_id"]
+
+            def run_conversation(self, **kwargs):
+                return {"final_response": "ok"}
+
+            def interrupt(self, message):
+                pass
+
+        module.AIAgent = RecordingAgent
+
+        module._run_agent_sync(
+            "hello",
+            "sess-1",
+            "gpt-5.4",
+            5,
+            __import__("threading").Event(),
+            None,
+            SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
+            reasoning_effort="none",
+        )
+
+        assert captured["kwargs"]["reasoning_config"] == {"enabled": False}
+
+    def test_run_agent_sync_disables_reasoning_when_config_none_and_request_omitted(self):
+        module = load_server_module()
+        module.hermes_config.load_config = lambda: {"agent": {"reasoning_effort": "none"}}
+        captured = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                self.session_id = kwargs["session_id"]
+
+            def run_conversation(self, **kwargs):
+                return {"final_response": "ok"}
+
+            def interrupt(self, message):
+                pass
+
+        module.AIAgent = RecordingAgent
+
+        module._run_agent_sync(
+            "hello",
+            "sess-1",
+            "gpt-5.4",
+            5,
+            __import__("threading").Event(),
+            None,
+            SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
+        )
+
+        assert captured["kwargs"]["reasoning_config"] == {"enabled": False}
 
     def test_run_agent_sync_interrupts_agent_when_cancel_event_is_set(self):
         module = load_server_module()
