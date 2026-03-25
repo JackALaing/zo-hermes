@@ -149,3 +149,9 @@ zo-hermes/
 ├── LICENSE
 └── README.md
 ```
+
+## Related docs
+
+- [`skill/SKILL.md`](./skill/SKILL.md) for operator-facing guidance
+- [`zo-discord` README](https://github.com/JackALaing/zo-discord/blob/main/README.md) for Discord-side integration behavior
+- [`zo-dispatcher` README](https://github.com/JackALaing/zo-dispatcher/blob/main/README.md) for dispatcher-side integration behavior
