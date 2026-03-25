@@ -116,9 +116,51 @@ logger = logging.getLogger("zo-hermes")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+def _load_required_hermes_defaults() -> tuple[str, int]:
+    try:
+        cfg = hermes_config.load_config()
+    except Exception as exc:
+        raise RuntimeError(
+            "zo-hermes requires a readable Hermes config with model.default and agent.max_turns set."
+        ) from exc
+
+    missing = []
+    model = None
+    max_iterations = None
+
+    if isinstance(cfg, dict):
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, dict):
+            value = model_cfg.get("default")
+            if isinstance(value, str) and value.strip():
+                model = value.strip()
+
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            value = agent_cfg.get("max_turns")
+            if value is not None:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    parsed = None
+                if parsed and parsed > 0:
+                    max_iterations = parsed
+
+    if model is None:
+        missing.append("model.default")
+    if max_iterations is None:
+        missing.append("agent.max_turns")
+    if missing:
+        raise RuntimeError(
+            "zo-hermes requires Hermes defaults in ~/.hermes/config.yaml. "
+            f"Missing or invalid: {', '.join(missing)}"
+        )
+
+    return model, max_iterations
+
+
 PORT = int(os.getenv("HERMES_API_PORT", "8788"))
-DEFAULT_MODEL = os.getenv("HERMES_DEFAULT_MODEL", "gpt-5.4")
-DEFAULT_MAX_ITERATIONS = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+DEFAULT_MODEL, DEFAULT_MAX_ITERATIONS = _load_required_hermes_defaults()
 HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
 SESSION_FILES_DIR = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "sessions"
 
@@ -476,6 +518,29 @@ def _resolve_model(requested_model: Optional[str]) -> tuple[str, Optional[str]]:
     return requested_model or DEFAULT_MODEL, None
 
 
+def _resolve_persona_warning(persona_id: Optional[str]) -> Optional[str]:
+    if not persona_id:
+        return None
+    return (
+        f"Hermes cannot use requested persona_id {persona_id}; continuing with the current "
+        "Hermes personality/prompt setup."
+    )
+
+
+def _response_headers(
+    conversation_id: str,
+    *,
+    model_fallback: Optional[str] = None,
+    persona_ignored: bool = False,
+) -> dict:
+    headers = {"X-Conversation-Id": conversation_id}
+    if model_fallback:
+        headers["X-Model-Fallback"] = model_fallback
+    if persona_ignored:
+        headers["X-Persona-Ignored"] = "true"
+    return headers
+
+
 def _resolve_reasoning_config(requested_effort: Optional[str]) -> dict:
     if requested_effort is not None:
         effort = str(requested_effort).strip().lower()
@@ -742,6 +807,10 @@ async def ask(req: AskRequest):
     """
     session_id = req.session_id or _generate_session_id()
     model, model_fallback = _resolve_model(req.model_name)
+    persona_warning = _resolve_persona_warning(req.persona_id)
+    persona_ignored = persona_warning is not None
+    if persona_warning:
+        logger.warning("%s", persona_warning)
     max_iterations = req.max_iterations or DEFAULT_MAX_ITERATIONS
     reasoning_effort = req.reasoning_effort
     skip_memory = req.skip_memory or False
@@ -752,7 +821,7 @@ async def ask(req: AskRequest):
         return JSONResponse(
             status_code=400,
             content={"error": str(e), "conversation_id": session_id},
-            headers={"X-Conversation-Id": session_id},
+            headers=_response_headers(session_id, persona_ignored=persona_ignored),
         )
     disabled_toolsets = req.disabled_toolsets
 
@@ -769,6 +838,7 @@ async def ask(req: AskRequest):
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
+                persona_ignored=persona_ignored,
             )
         except Exception:
             _unregister_active_session(active_session)
@@ -781,6 +851,7 @@ async def ask(req: AskRequest):
         reasoning_effort=reasoning_effort, skip_memory=skip_memory,
         skip_context=skip_context, enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
+        persona_ignored=persona_ignored,
     )
 
 
@@ -798,6 +869,7 @@ async def _handle_non_streaming(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     model_fallback: Optional[str] = None,
+    persona_ignored: bool = False,
 ) -> JSONResponse:
     """Non-streaming mode for zo-dispatcher: returns JSON with output + conversation_id."""
     loop = asyncio.get_event_loop()
@@ -824,16 +896,17 @@ async def _handle_non_streaming(
 
         output = result.get("final_response", "")
         effective_session_id = result.get("_session_id", session_id)
-        headers = {"X-Conversation-Id": effective_session_id}
-        if model_fallback:
-            headers["X-Model-Fallback"] = model_fallback
         return JSONResponse(
             content={
                 "output": output,
                 "conversation_id": effective_session_id,
                 "model_fallback": model_fallback,
             },
-            headers=headers,
+            headers=_response_headers(
+                effective_session_id,
+                model_fallback=model_fallback,
+                persona_ignored=persona_ignored,
+            ),
         )
 
     except Exception as e:
@@ -841,6 +914,7 @@ async def _handle_non_streaming(
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "conversation_id": session_id},
+            headers=_response_headers(session_id, persona_ignored=persona_ignored),
         )
     finally:
         if active_session is not None:
@@ -861,6 +935,7 @@ async def _handle_streaming(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     model_fallback: Optional[str] = None,
+    persona_ignored: bool = False,
 ) -> StreamingResponse:
     """Streaming mode for zo-discord: returns SSE with Zo-compatible events."""
     loop = asyncio.get_event_loop()
@@ -1003,8 +1078,11 @@ async def _handle_streaming(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "X-Conversation-Id": session_id,
-            **({"X-Model-Fallback": model_fallback} if model_fallback else {}),
+            **_response_headers(
+                session_id,
+                model_fallback=model_fallback,
+                persona_ignored=persona_ignored,
+            ),
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         },

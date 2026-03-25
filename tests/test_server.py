@@ -9,6 +9,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def run(coro):
     return asyncio.run(coro)
@@ -47,7 +49,7 @@ class FakeSessionDB:
         )
 
 
-def load_server_module():
+def load_server_module(config_data=None):
     service_dir = Path("/home/workspace/Services/zo-hermes")
     module_name = "zo_hermes_server_test"
 
@@ -79,7 +81,9 @@ def load_server_module():
         "api_mode": "responses",
     }
     fake_config = types.ModuleType("hermes_cli.config")
-    fake_config.load_config = lambda: {
+    merged_config = {
+        "model": {"default": "gpt-5.4"},
+        "agent": {"max_turns": 90},
         "mcp_servers": {
             "zo": {
                 "headers": {
@@ -88,6 +92,9 @@ def load_server_module():
             }
         }
     }
+    if config_data:
+        merged_config.update(config_data)
+    fake_config.load_config = lambda: merged_config
     fake_model_tools = types.ModuleType("model_tools")
     fake_agent_parent = types.ModuleType("agent")
     fake_prompt_builder = types.ModuleType("agent.prompt_builder")
@@ -627,6 +634,42 @@ class TestSessionEndpoints:
 
 
 class TestStreamingAndAgentBehavior:
+    def test_module_uses_hermes_config_defaults_even_when_bridge_env_vars_are_set(self):
+        old_model = os.environ.get("HERMES_DEFAULT_MODEL")
+        old_max_iterations = os.environ.get("HERMES_MAX_ITERATIONS")
+        try:
+            os.environ["HERMES_DEFAULT_MODEL"] = "env-model"
+            os.environ["HERMES_MAX_ITERATIONS"] = "123"
+            module = load_server_module(
+                config_data={
+                    "model": {"default": "cfg-model"},
+                    "agent": {"max_turns": 77},
+                }
+            )
+            assert module.DEFAULT_MODEL == "cfg-model"
+            assert module.DEFAULT_MAX_ITERATIONS == 77
+        finally:
+            if old_model is None:
+                os.environ.pop("HERMES_DEFAULT_MODEL", None)
+            else:
+                os.environ["HERMES_DEFAULT_MODEL"] = old_model
+            if old_max_iterations is None:
+                os.environ.pop("HERMES_MAX_ITERATIONS", None)
+            else:
+                os.environ["HERMES_MAX_ITERATIONS"] = old_max_iterations
+
+    def test_module_requires_model_and_max_turns_in_hermes_config(self):
+        old_model = os.environ.pop("HERMES_DEFAULT_MODEL", None)
+        old_max_iterations = os.environ.pop("HERMES_MAX_ITERATIONS", None)
+        try:
+            with pytest.raises(RuntimeError, match="model.default.*agent.max_turns"):
+                load_server_module(config_data={"model": {}, "agent": {}})
+        finally:
+            if old_model is not None:
+                os.environ["HERMES_DEFAULT_MODEL"] = old_model
+            if old_max_iterations is not None:
+                os.environ["HERMES_MAX_ITERATIONS"] = old_max_iterations
+
     def test_non_streaming_includes_model_fallback_header_and_body(self):
         module = load_server_module()
 
@@ -650,6 +693,28 @@ class TestStreamingAndAgentBehavior:
         body = json.loads(response.body)
         assert body["model_fallback"].startswith("Hermes cannot use requested model")
         assert response.headers["X-Model-Fallback"].startswith("Hermes cannot use requested model")
+
+    def test_non_streaming_includes_persona_ignored_header(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {"final_response": "done", "_session_id": "sess-1"}
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+                persona_ignored=True,
+            )
+        )
+
+        assert response.headers["X-Persona-Ignored"] == "true"
 
     def test_non_streaming_returns_updated_conversation_header(self):
         module = load_server_module()
