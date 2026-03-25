@@ -162,6 +162,11 @@ def _load_required_hermes_defaults() -> tuple[str, int]:
 PORT = int(os.getenv("HERMES_API_PORT", "8788"))
 DEFAULT_MODEL, DEFAULT_MAX_ITERATIONS = _load_required_hermes_defaults()
 HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
+# Keep Hermes context discovery anchored to the Zo workspace rather than the
+# hermes-agent install directory. Upstream Hermes now prefers TERMINAL_CWD when
+# building context-file prompt sections, so align it with the bridge's working
+# tree here.
+os.environ["TERMINAL_CWD"] = HERMES_CWD
 SESSION_FILES_DIR = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "sessions"
 
 

@@ -42,6 +42,8 @@ Run `zo-hermes` with:
 
 This matters because it gives Hermes the same working tree and file access that the Zo agent has. In practice it means Hermes can see the same project files, `AGENTS.md`, and workspace state that Zo can.
 
+`zo-hermes` also aligns `TERMINAL_CWD` to `HERMES_CWD` at startup so Hermes context-file discovery resolves against the workspace instead of the hermes-agent install directory.
+
 No `AGENTS.md` symlink is needed. When Hermes runs with `HERMES_CWD=/home/workspace`, it will pick up `/home/workspace/AGENTS.md` automatically.
 
 ### Symlinks for Zo parity

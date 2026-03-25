@@ -680,6 +680,56 @@ class TestStreamingAndAgentBehavior:
             if old_max_iterations is not None:
                 os.environ["HERMES_MAX_ITERATIONS"] = old_max_iterations
 
+    def test_run_agent_sync_uses_hermes_cwd_for_context_discovery(self, tmp_path):
+        old_hermes_cwd = os.environ.get("HERMES_CWD")
+        old_terminal_cwd = os.environ.get("TERMINAL_CWD")
+        loop = asyncio.new_event_loop()
+        try:
+            hermes_cwd = str(tmp_path / "zo-hermes-context")
+            Path(hermes_cwd).mkdir(parents=True, exist_ok=True)
+            os.environ["HERMES_CWD"] = hermes_cwd
+            os.environ["TERMINAL_CWD"] = "/opt/hermes-agent"
+            module = load_server_module()
+            seen = {}
+
+            class CapturingAgent:
+                def __init__(self, **kwargs):
+                    self.kwargs = kwargs
+                    self.session_id = kwargs["session_id"]
+
+                def run_conversation(self, **kwargs):
+                    seen["cwd"] = os.getcwd()
+                    seen["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+                    return {"final_response": "ok"}
+
+                def interrupt(self, message):
+                    return None
+
+            module.AIAgent = CapturingAgent
+
+            result = module._run_agent_sync(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                loop=loop,
+            )
+
+            assert result["final_response"] == "ok"
+            assert seen["cwd"] == hermes_cwd
+            assert seen["terminal_cwd"] == hermes_cwd
+        finally:
+            loop.close()
+            if old_hermes_cwd is None:
+                os.environ.pop("HERMES_CWD", None)
+            else:
+                os.environ["HERMES_CWD"] = old_hermes_cwd
+            if old_terminal_cwd is None:
+                os.environ.pop("TERMINAL_CWD", None)
+            else:
+                os.environ["TERMINAL_CWD"] = old_terminal_cwd
+
     def test_non_streaming_includes_model_fallback_header_and_body(self):
         module = load_server_module()
 
