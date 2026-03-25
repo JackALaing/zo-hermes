@@ -20,4 +20,4 @@ pip install --quiet --break-system-packages fastapi uvicorn 2>/dev/null || true
 # Run from workspace dir (Hermes CWD)
 cd /home/workspace
 
-exec python "$SCRIPT_DIR/server.py"
+exec python "$SCRIPT_DIR/launch_server.py"
