@@ -574,6 +574,7 @@ class AskRequest(BaseModel):
     input: str
     stream: bool = False
     session_id: Optional[str] = Field(None, alias="conversation_id")
+    honcho_session_key: Optional[str] = None
     model_name: Optional[str] = None
     persona_id: Optional[str] = None
     ephemeral_system_prompt: Optional[str] = None
@@ -615,6 +616,7 @@ def _run_agent_sync(
     message_queue: Optional[asyncio.Queue] = None,
     clarify_queue: Optional[asyncio.Queue] = None,
     ephemeral_system_prompt: Optional[str] = None,
+    honcho_session_key: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -729,6 +731,8 @@ def _run_agent_sync(
         agent_kwargs["enabled_toolsets"] = enabled_toolsets
     if disabled_toolsets is not None:
         agent_kwargs["disabled_toolsets"] = disabled_toolsets
+    if honcho_session_key is not None:
+        agent_kwargs["honcho_session_key"] = honcho_session_key
 
     agent = AIAgent(**agent_kwargs)
     _session_agents[session_id] = agent
@@ -835,6 +839,7 @@ async def ask(req: AskRequest):
                 req.input, session_id, model, max_iterations, cancel_event,
                 active_session,
                 ephemeral_system_prompt=req.ephemeral_system_prompt,
+                honcho_session_key=req.honcho_session_key,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
@@ -848,6 +853,7 @@ async def ask(req: AskRequest):
         req.input, session_id, model, max_iterations, cancel_event,
         active_session,
         ephemeral_system_prompt=req.ephemeral_system_prompt,
+        honcho_session_key=req.honcho_session_key,
         reasoning_effort=reasoning_effort, skip_memory=skip_memory,
         skip_context=skip_context, enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
@@ -863,6 +869,7 @@ async def _handle_non_streaming(
     cancel_event: threading.Event,
     active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
+    honcho_session_key: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -888,6 +895,7 @@ async def _handle_non_streaming(
                 thinking_queue=None,
                 message_queue=None,
                 ephemeral_system_prompt=ephemeral_system_prompt,
+                honcho_session_key=honcho_session_key,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -929,6 +937,7 @@ async def _handle_streaming(
     cancel_event: threading.Event,
     active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
+    honcho_session_key: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -958,6 +967,7 @@ async def _handle_streaming(
             message_queue=message_queue,
             clarify_queue=clarify_queue,
             ephemeral_system_prompt=ephemeral_system_prompt,
+            honcho_session_key=honcho_session_key,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
             skip_context=skip_context, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,

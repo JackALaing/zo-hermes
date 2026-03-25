@@ -229,6 +229,14 @@ class TestAskRequest:
         req = module.AskRequest.model_validate({"input": "hello", "session_id": "sess-1"})
         assert req.session_id == "sess-1"
 
+    def test_accepts_honcho_session_key(self):
+        module = load_server_module()
+        req = module.AskRequest.model_validate(
+            {"input": "hello", "conversation_id": "conv-1", "honcho_session_key": "discord-thread-123"}
+        )
+        assert req.session_id == "conv-1"
+        assert req.honcho_session_key == "discord-thread-123"
+
 
 class TestZoMcpConfigExpansion:
     def test_expands_env_vars_in_loaded_config(self):
@@ -321,6 +329,7 @@ class TestAskEndpoint:
                 "input": "hello",
                 "stream": False,
                 "conversation_id": "conv-1",
+                "honcho_session_key": "discord-thread-123",
                 "reasoning_effort": "high",
                 "skip_memory": True,
                 "skip_context": True,
@@ -333,6 +342,7 @@ class TestAskEndpoint:
         run(module.ask(req))
 
         assert captured["args"][1] == "conv-1"
+        assert captured["kwargs"]["honcho_session_key"] == "discord-thread-123"
         assert captured["kwargs"]["reasoning_effort"] == "high"
         assert captured["kwargs"]["skip_memory"] is True
         assert captured["kwargs"]["skip_context"] is True
@@ -864,10 +874,12 @@ class TestStreamingAndAgentBehavior:
             SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
             thinking_queue=thinking_queue,
             ephemeral_system_prompt="## Message Source\nDiscord context",
+            honcho_session_key="discord-thread-123",
         )
 
         assert result["_session_id"] == "sess-1"
         assert captured["kwargs"]["pass_session_id"] is True
+        assert captured["kwargs"]["honcho_session_key"] == "discord-thread-123"
         assert captured["user_message"] == "Original prompt"
         assert captured["kwargs"]["ephemeral_system_prompt"] == "## Message Source\nDiscord context"
         assert queued == [("thinking", "Plan the answer carefully with detailed steps and reflect before replying.")]
