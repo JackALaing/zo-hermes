@@ -43,42 +43,70 @@ class _SafeStreamProxy:
 
 
 _PATCH_FLAG = "_zo_safe_output_patch"
-_OPENAI_PATCH_FLAG = "_zo_safe_chat_message_patch"
+_OPENAI_PATCH_FLAG = "_zo_safe_openai_model_patch"
 
 
-def _patch_openai_chat_message() -> None:
+def _safe_model_value(model, name):
     try:
-        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+        state = object.__getattribute__(model, "__dict__")
+    except Exception:
+        state = {}
+    if name in state:
+        return state.get(name)
+
+    for attr_name in ("__pydantic_extra__", "__pydantic_private__"):
+        try:
+            extra = object.__getattribute__(model, attr_name)
+        except Exception:
+            extra = None
+        if isinstance(extra, dict) and name in extra:
+            return extra.get(name)
+
+    return None
+
+
+def _patch_openai_base_model() -> None:
+    try:
+        from openai import BaseModel as OpenAIBaseModel
     except Exception:
         return
 
-    if getattr(ChatCompletionMessage, _OPENAI_PATCH_FLAG, False):
+    if getattr(OpenAIBaseModel, _OPENAI_PATCH_FLAG, False):
         return
 
-    original_getattribute = ChatCompletionMessage.__getattribute__
-    original_setattr = ChatCompletionMessage.__setattr__
-    safe_fields = {"tool_calls", "content", "reasoning_details"}
+    original_getattribute = OpenAIBaseModel.__getattribute__
+    original_setattr = OpenAIBaseModel.__setattr__
 
     def patched_getattribute(self, name):
         try:
             return original_getattribute(self, name)
         except ValueError as exc:
-            if name in safe_fields and "closed file" in str(exc).lower():
-                return object.__getattribute__(self, "__dict__").get(name)
+            if "closed file" in str(exc).lower():
+                return _safe_model_value(self, name)
             raise
 
     def patched_setattr(self, name, value):
-        if name in safe_fields:
+        try:
+            return original_setattr(self, name, value)
+        except ValueError as exc:
+            if "closed file" not in str(exc).lower():
+                raise
             try:
                 object.__setattr__(self, name, value)
                 return
             except Exception:
-                pass
-        return original_setattr(self, name, value)
+                try:
+                    state = object.__getattribute__(self, "__dict__")
+                except Exception:
+                    state = None
+                if isinstance(state, dict):
+                    state[name] = value
+                    return
+                raise
 
-    ChatCompletionMessage.__getattribute__ = patched_getattribute
-    ChatCompletionMessage.__setattr__ = patched_setattr
-    setattr(ChatCompletionMessage, _OPENAI_PATCH_FLAG, True)
+    OpenAIBaseModel.__getattribute__ = patched_getattribute
+    OpenAIBaseModel.__setattr__ = patched_setattr
+    setattr(OpenAIBaseModel, _OPENAI_PATCH_FLAG, True)
 
 
 
@@ -112,4 +140,4 @@ def apply_runtime_patches() -> None:
         setattr(spinner_cls, _PATCH_FLAG, True)
         display.write_tty = patched_write_tty
 
-    _patch_openai_chat_message()
+    _patch_openai_base_model()
