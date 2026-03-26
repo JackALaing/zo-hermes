@@ -43,36 +43,73 @@ class _SafeStreamProxy:
 
 
 _PATCH_FLAG = "_zo_safe_output_patch"
+_OPENAI_PATCH_FLAG = "_zo_safe_chat_message_patch"
+
+
+def _patch_openai_chat_message() -> None:
+    try:
+        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+    except Exception:
+        return
+
+    if getattr(ChatCompletionMessage, _OPENAI_PATCH_FLAG, False):
+        return
+
+    original_getattribute = ChatCompletionMessage.__getattribute__
+    original_setattr = ChatCompletionMessage.__setattr__
+    safe_fields = {"tool_calls", "content", "reasoning_details"}
+
+    def patched_getattribute(self, name):
+        try:
+            return original_getattribute(self, name)
+        except ValueError as exc:
+            if name in safe_fields and "closed file" in str(exc).lower():
+                return object.__getattribute__(self, "__dict__").get(name)
+            raise
+
+    def patched_setattr(self, name, value):
+        if name in safe_fields:
+            try:
+                object.__setattr__(self, name, value)
+                return
+            except Exception:
+                pass
+        return original_setattr(self, name, value)
+
+    ChatCompletionMessage.__getattribute__ = patched_getattribute
+    ChatCompletionMessage.__setattr__ = patched_setattr
+    setattr(ChatCompletionMessage, _OPENAI_PATCH_FLAG, True)
+
 
 
 def apply_runtime_patches() -> None:
     import agent.display as display
 
     spinner_cls = display.KawaiiSpinner
-    if getattr(spinner_cls, _PATCH_FLAG, False):
-        return
+    if not getattr(spinner_cls, _PATCH_FLAG, False):
+        original_init = spinner_cls.__init__
 
-    original_init = spinner_cls.__init__
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            if not isinstance(self._out, _SafeStreamProxy):
+                self._out = _SafeStreamProxy(self._out)
 
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        if not isinstance(self._out, _SafeStreamProxy):
-            self._out = _SafeStreamProxy(self._out)
-
-    def patched_write_tty(text: str) -> None:
-        try:
-            fd = os.open("/dev/tty", os.O_WRONLY)
+        def patched_write_tty(text: str) -> None:
             try:
-                os.write(fd, text.encode("utf-8"))
-            finally:
-                os.close(fd)
-        except OSError:
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except (OSError, ValueError):
-                pass
+                fd = os.open("/dev/tty", os.O_WRONLY)
+                try:
+                    os.write(fd, text.encode("utf-8"))
+                finally:
+                    os.close(fd)
+            except OSError:
+                try:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
 
-    spinner_cls.__init__ = patched_init
-    setattr(spinner_cls, _PATCH_FLAG, True)
-    display.write_tty = patched_write_tty
+        spinner_cls.__init__ = patched_init
+        setattr(spinner_cls, _PATCH_FLAG, True)
+        display.write_tty = patched_write_tty
+
+    _patch_openai_chat_message()
