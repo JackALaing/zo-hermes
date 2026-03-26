@@ -175,7 +175,11 @@ Register zo-hermes as a user service with:
 - activate `/opt/hermes-agent/venv`
 - run `server.py`
 
-To restart after config or code changes, update the user service rather than killing the process manually.
+For config or code changes, use `update_user_service`. Hosted services restart automatically when updated, so that applies the change and restarts the service in one step.
+
+If the service appears to still be running old code after an update, run `service_doctor`. It can detect stale-code situations and is the first check before assuming the update failed.
+
+Do not kill the process manually with `kill` or `pkill`; Zo will auto-restart it and you can end up with duplicate processes.
 
 ## Direct Usage
 
