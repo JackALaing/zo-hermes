@@ -5,7 +5,6 @@ compatibility: Created for Zo Computer
 metadata:
   author: jackal.zo.computer
 ---
-
 # zo-hermes
 
 Use this skill when setting up or operating `zo-hermes` on Zo Computer.
@@ -46,23 +45,62 @@ This matters because it gives Hermes the same working tree and file access that 
 
 No `AGENTS.md` symlink is needed. When Hermes runs with `HERMES_CWD=/home/workspace`, it will pick up `/home/workspace/AGENTS.md` automatically.
 
-### Symlinks for Zo parity
+### Recommended symlinks for Zo parity
 
-Recommended symlinks:
+Use:
 
 ```bash
 ln -sfn /root/.zo_secrets ~/.hermes/.env
 ln -sfn /home/workspace/SOUL.md ~/.hermes/SOUL.md
+```
+
+Why:
+
+- `~/.hermes/.env -> /root/.zo_secrets` lets Hermes read the same secrets as Zo services.
+- `~/.hermes/SOUL.md` should point to whichever `SOUL.md` file you want Hermes to use. `/home/workspace/SOUL.md` is the default assumption, but use your real SOUL path if it lives elsewhere.
+
+#### Skills directory rule
+
+Keep `/home/workspace/Skills` as a **real directory**. Point `~/.hermes/skills` at it with a symlink.
+
+Do **not** replace `/home/workspace/Skills` with a symlink if you want Zo's Skills UI to keep working.
+
+If `~/.hermes/skills` does not exist yet, use:
+
+```bash
+ln -sfn /home/workspace/Skills ~/.hermes/skills
+```
+
+If `~/.hermes/skills` already exists and you want to keep its contents:
+
+1. merge any skills you want to keep into `/home/workspace/Skills`
+2. rename or remove the existing `~/.hermes/skills`
+3. create the symlink
+
+Example:
+
+```bash
+mv ~/.hermes/skills ~/.hermes/skills.backup
 ln -sfn /home/workspace/Skills ~/.hermes/skills
 ```
 
 Why:
 
-- `~/.hermes/.env -> /root/.zo_secrets` lets Hermes read the same secrets as Zo services
-- `~/.hermes/SOUL.md` should point to whichever `SOUL.md` file you want Hermes to use. `/home/workspace/SOUL.md` is the default assumption, but use your real SOUL path if it lives elsewhere.
-- `~/.hermes/skills -> /home/workspace/Skills` makes Zo skills appear in Hermes Agent's system prompt `available_skills` list, so Hermes is aware they exist
+- `~/.hermes/skills -> /home/workspace/Skills` makes the Zo-managed skills tree visible in Hermes' system prompt, including the `available_skills` list.
 
-If `~/.hermes/skills` already contains standalone Hermes skills, back it up or merge carefully before replacing it with a symlink.
+Important:
+
+- `ln -sfn /home/workspace/Skills ~/.hermes/skills` is the correct symlink direction, but it is **not** a complete replacement procedure if `~/.hermes/skills` already exists as a real directory.
+- Before flattening Hermes content into `/home/workspace/Skills`, compare the top-level names on both sides. Overlaps such as `github` or `software-development` need an explicit decision: keep namespaced, merge cleanly, or retire the overlapping skill first.
+- If entries already exist inside `/home/workspace/Skills` and point to externally maintained locations, preserve those links during the merge instead of replacing them with copied files.
+- In practice, Hermes can load nested skills from the filesystem, but Zo's Skills UI may only surface top-level skill folders that contain a direct `SKILL.md`. Nested Hermes-style category trees may therefore be easier to access from the filesystem than from the Zo UI.
+
+Verification:
+
+- `/home/workspace/Skills` is a real directory.
+- `~/.hermes/skills` is a symlink to `/home/workspace/Skills`.
+- Zo can list `/home/workspace/Skills`.
+- Hermes can load at least one Zo skill and one Hermes skill from the unified tree.
 
 ### Important Zo-specific limits
 
