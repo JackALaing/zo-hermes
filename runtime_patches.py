@@ -5,6 +5,7 @@ These patches live in zo-hermes so they survive Hermes updates under /opt/hermes
 
 from __future__ import annotations
 
+import builtins
 import os
 import sys
 from pathlib import Path
@@ -44,6 +45,8 @@ class _SafeStreamProxy:
 
 _PATCH_FLAG = "_zo_safe_output_patch"
 _OPENAI_PATCH_FLAG = "_zo_safe_openai_model_patch"
+_PRINT_PATCH_FLAG = "_zo_safe_print_patch"
+_AGENT_PATCH_FLAG = "_zo_safe_agent_print_patch"
 
 
 def _safe_model_value(model, name):
@@ -109,9 +112,54 @@ def _patch_openai_base_model() -> None:
     setattr(OpenAIBaseModel, _OPENAI_PATCH_FLAG, True)
 
 
+def _patch_stdio_streams() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and not isinstance(stream, _SafeStreamProxy):
+            setattr(sys, stream_name, _SafeStreamProxy(stream))
+
+
+def _patch_builtin_print() -> None:
+    original_print = builtins.print
+    if getattr(original_print, _PRINT_PATCH_FLAG, False):
+        return
+
+    def safe_print(*args, **kwargs):
+        try:
+            return original_print(*args, **kwargs)
+        except (OSError, ValueError):
+            return None
+
+    setattr(safe_print, _PRINT_PATCH_FLAG, True)
+    builtins.print = safe_print
+
+
+def _patch_agent_printing() -> None:
+    import run_agent as run_agent_module
+
+    agent_cls = run_agent_module.AIAgent
+    if getattr(agent_cls, _AGENT_PATCH_FLAG, False):
+        return
+
+    original_safe_print = agent_cls._safe_print
+
+    def patched_safe_print(self, *args, **kwargs):
+        try:
+            return original_safe_print(self, *args, **kwargs)
+        except (OSError, ValueError):
+            return None
+
+    agent_cls._safe_print = patched_safe_print
+    setattr(agent_cls, _AGENT_PATCH_FLAG, True)
+
+
 
 def apply_runtime_patches() -> None:
     import agent.display as display
+
+    _patch_stdio_streams()
+    _patch_builtin_print()
+    _patch_agent_printing()
 
     spinner_cls = display.KawaiiSpinner
     if not getattr(spinner_cls, _PATCH_FLAG, False):
