@@ -7,6 +7,7 @@ Localhost only — no auth needed.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -286,17 +287,44 @@ def _write_session_file_messages(session_id: str, messages: List[dict]) -> None:
 
 
 def _load_db_messages(session_id: str) -> List[dict]:
+    session_db = _get_session_db()
+
     try:
-        return _get_session_db().get_messages_as_conversation(session_id)
+        raw_messages = session_db.get_messages(session_id)
+    except Exception:
+        raw_messages = []
+
+    if raw_messages:
+        return [_to_replay_safe_message(msg) for msg in raw_messages]
+
+    try:
+        return [_to_replay_safe_message(msg) for msg in session_db.get_messages_as_conversation(session_id)]
     except Exception:
         return []
 
 
-def _normalize_message(msg: dict) -> dict:
-    normalized = {"role": msg.get("role", "unknown"), "content": msg.get("content")}
-    for key in ("tool_name", "tool_calls", "tool_call_id"):
-        if msg.get(key) is not None:
-            normalized[key] = msg.get(key)
+_BRIDGE_LOCAL_MESSAGE_KEYS = frozenset({"id", "session_id", "timestamp", "token_count"})
+
+
+def _to_replay_safe_message(msg: dict) -> dict:
+    if not isinstance(msg, dict):
+        return {"role": "unknown", "content": None}
+
+    normalized = copy.deepcopy(msg)
+
+    for key in _BRIDGE_LOCAL_MESSAGE_KEYS:
+        normalized.pop(key, None)
+
+    for key in ("tool_calls", "reasoning_details", "codex_reasoning_items"):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            try:
+                normalized[key] = json.loads(value)
+            except (TypeError, ValueError):
+                pass
+
+    normalized.setdefault("role", "unknown")
+    normalized.setdefault("content", None)
     return normalized
 
 
@@ -313,13 +341,13 @@ def _load_best_history(session_id: str) -> tuple[str, List[dict]]:
     agent = _session_agents.get(canonical_id) or _session_agents.get(session_id)
     history = getattr(agent, "conversation_history", None) if agent else None
     if history:
-        candidates.append(("agent", [_normalize_message(msg) for msg in history]))
+        candidates.append(("agent", [_to_replay_safe_message(msg) for msg in history]))
 
     for candidate_id in candidate_ids:
-        db_messages = [_normalize_message(msg) for msg in _load_db_messages(candidate_id)]
+        db_messages = _load_db_messages(candidate_id)
         if db_messages:
             candidates.append(("db", db_messages))
-        file_messages = [_normalize_message(msg) for msg in _load_session_file_messages(candidate_id)]
+        file_messages = [_to_replay_safe_message(msg) for msg in _load_session_file_messages(candidate_id)]
         if file_messages:
             candidates.append(("file", file_messages))
 
@@ -332,18 +360,24 @@ def _load_best_history(session_id: str) -> tuple[str, List[dict]]:
 
 
 def _rewrite_session_history(session_id: str, messages: List[dict]) -> None:
+    rewritten = [_to_replay_safe_message(msg) for msg in messages]
     session_db = _get_session_db()
     session_db.clear_messages(session_id)
-    for msg in messages:
+    for msg in rewritten:
+        role = msg.get("role", "unknown")
         session_db.append_message(
             session_id=session_id,
-            role=msg.get("role", "unknown"),
+            role=role,
             content=msg.get("content"),
             tool_name=msg.get("tool_name"),
             tool_calls=msg.get("tool_calls"),
             tool_call_id=msg.get("tool_call_id"),
+            finish_reason=msg.get("finish_reason"),
+            reasoning=msg.get("reasoning") if role == "assistant" else None,
+            reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+            codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
         )
-    _write_session_file_messages(session_id, messages)
+    _write_session_file_messages(session_id, rewritten)
 
 
 def _has_compaction_summary(messages: List[dict]) -> bool:
@@ -451,7 +485,7 @@ def _ensure_compaction_summary(session_id: str, source_messages: List[dict]) -> 
     _rewrite_session_history(session_id, rewritten)
     agent = _session_agents.get(session_id)
     if agent and hasattr(agent, "conversation_history"):
-        agent.conversation_history = rewritten
+        agent.conversation_history = [_to_replay_safe_message(msg) for msg in rewritten]
     logger.info("Injected fallback compaction summary into session %s", session_id)
     return True
 
@@ -544,6 +578,96 @@ def _response_headers(
     if persona_ignored:
         headers["X-Persona-Ignored"] = "true"
     return headers
+
+
+def _has_visible_text(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _map_turn_status(
+    *,
+    completed: bool,
+    partial: bool,
+    failed: bool,
+    interrupted: bool,
+    raw_error: Optional[str],
+    hermes_final_response_present: bool,
+    streamed_text_present: bool,
+    bridge_error: Optional[str],
+) -> str:
+    if bridge_error:
+        return "error"
+    if partial or interrupted:
+        return "partial"
+    if failed:
+        return "failed"
+    if completed and hermes_final_response_present:
+        return "completed"
+    if completed and streamed_text_present:
+        return "completed_streamed_only"
+    if completed:
+        return "empty_success"
+    if raw_error:
+        return "error"
+    return "failed"
+
+
+def _map_terminal_outcome(
+    raw_result: Optional[dict],
+    *,
+    streamed_text: str = "",
+    bridge_error: Optional[Exception | str] = None,
+) -> dict:
+    raw_result = raw_result or {}
+    bridge_error_text = str(bridge_error) if bridge_error else None
+
+    final_response = raw_result.get("final_response")
+    final_response_text = final_response if isinstance(final_response, str) else ""
+    hermes_final_response_present = _has_visible_text(final_response_text)
+    streamed_text_present = _has_visible_text(streamed_text)
+
+    if hermes_final_response_present:
+        output = final_response_text
+        output_source = "final_response"
+    elif streamed_text_present:
+        output = streamed_text
+        output_source = "streamed_text"
+    else:
+        output = ""
+        output_source = "none"
+
+    raw_error = raw_result.get("error")
+    if raw_error is not None and not isinstance(raw_error, str):
+        raw_error = str(raw_error)
+
+    completed = bool(raw_result.get("completed"))
+    partial = bool(raw_result.get("partial"))
+    failed = bool(raw_result.get("failed"))
+    interrupted = bool(raw_result.get("interrupted"))
+
+    return {
+        "output": output,
+        "result": {
+            "turn_status": _map_turn_status(
+                completed=completed,
+                partial=partial,
+                failed=failed,
+                interrupted=interrupted,
+                raw_error=raw_error,
+                hermes_final_response_present=hermes_final_response_present,
+                streamed_text_present=streamed_text_present,
+                bridge_error=bridge_error_text,
+            ),
+            "output_source": output_source,
+            "output_present": _has_visible_text(output),
+            "hermes_final_response_present": hermes_final_response_present,
+            "completed": completed,
+            "partial": partial,
+            "failed": failed,
+            "interrupted": interrupted,
+            "error": bridge_error_text if bridge_error_text is not None else raw_error,
+        },
+    }
 
 
 def _resolve_reasoning_config(requested_effort: Optional[str]) -> dict:
@@ -668,17 +792,15 @@ def _run_agent_sync(
                 pass
 
     # stream_callback goes on run_conversation (called with text deltas)
-    # Also accumulate streamed text as fallback when final_response is empty
     streamed_text_parts: list[str] = []
-    stream_cb = None
-    if message_queue is not None:
-
-        def stream_cb(text: str):
-            streamed_text_parts.append(text)
-            try:
-                loop.call_soon_threadsafe(message_queue.put_nowait, ("message", text))
-            except Exception:
-                pass
+    def stream_cb(text: str):
+        streamed_text_parts.append(text)
+        if message_queue is None:
+            return
+        try:
+            loop.call_soon_threadsafe(message_queue.put_nowait, ("message", text))
+        except Exception:
+            pass
 
     # Clarify callback: blocks agent thread, signals SSE to emit ClarifyEvent,
     # waits for response from POST /clarify-response
@@ -765,13 +887,6 @@ def _run_agent_sync(
     finally:
         os.chdir(original_cwd)
 
-    # If final_response is empty but we streamed text, use the streamed text.
-    # This happens when the agent does tool work and the response is in the
-    # stream but not captured as final_response by run_conversation().
-    if not result.get("final_response") and streamed_text_parts:
-        result["final_response"] = "".join(streamed_text_parts)
-        logger.info("Using streamed text as final_response (was empty)")
-
     # After compression, agent.session_id may have changed. Propagate it.
     effective_id = agent.session_id
     if effective_id != session_id:
@@ -781,6 +896,7 @@ def _run_agent_sync(
             _register_session_alias(active_session, effective_id)
         _ensure_compaction_summary(effective_id, conversation_history or [])
     result["_session_id"] = effective_id
+    result["_bridge_streamed_text"] = "".join(streamed_text_parts)
     return result
 
 
@@ -907,13 +1023,17 @@ async def _handle_non_streaming(
             ),
         )
 
-        output = result.get("final_response", "")
         effective_session_id = result.get("_session_id", session_id)
+        terminal_outcome = _map_terminal_outcome(
+            result,
+            streamed_text=result.get("_bridge_streamed_text", ""),
+        )
         return JSONResponse(
             content={
-                "output": output,
+                "output": terminal_outcome["output"],
                 "conversation_id": effective_session_id,
                 "model_fallback": model_fallback,
+                "result": terminal_outcome["result"],
             },
             headers=_response_headers(
                 effective_session_id,
@@ -924,10 +1044,21 @@ async def _handle_non_streaming(
 
     except Exception as e:
         logger.exception("Error in non-streaming ask for session %s", session_id)
+        terminal_outcome = _map_terminal_outcome(None, bridge_error=e)
         return JSONResponse(
             status_code=500,
-            content={"error": str(e), "conversation_id": session_id},
-            headers=_response_headers(session_id, persona_ignored=persona_ignored),
+            content={
+                "output": terminal_outcome["output"],
+                "conversation_id": session_id,
+                "error": str(e),
+                "model_fallback": model_fallback,
+                "result": terminal_outcome["result"],
+            },
+            headers=_response_headers(
+                session_id,
+                model_fallback=model_fallback,
+                persona_ignored=persona_ignored,
+            ),
         )
     finally:
         if active_session is not None:
@@ -1056,6 +1187,12 @@ async def _handle_streaming(
             # Agent finished — get result
             result = agent_task.result()
             final_response = result.get("final_response", "")
+            authoritative_streamed_text = result.get("_bridge_streamed_text", "")
+            terminal_outcome = _map_terminal_outcome(
+                result,
+                streamed_text=authoritative_streamed_text or text_buffer,
+            )
+            caller_output = terminal_outcome["output"]
 
             # Close any open text part
             if in_text_part:
@@ -1079,12 +1216,16 @@ async def _handle_streaming(
             # End event with complete output and potentially-updated session_id
             effective_session_id = result.get("_session_id", session_id)
             yield _sse_event("End", {
-                "data": {"output": final_response, "conversation_id": effective_session_id}
+                "data": {
+                    "output": caller_output,
+                    "conversation_id": effective_session_id,
+                    "result": terminal_outcome["result"],
+                }
             })
 
         except Exception as e:
             logger.exception("Error in SSE stream for session %s", session_id)
-            yield _sse_event("SSEErrorEvent", {"message": str(e)})
+            yield _sse_event("SSEErrorEvent", {"message": str(e), "turn_status": "error"})
         finally:
             if active_session is not None:
                 _unregister_active_session(active_session)
@@ -1165,7 +1306,7 @@ async def undo(req: SessionRequest):
     # Also update in-memory agent history if we have one
     agent = _session_agents.get(resolved_session_id)
     if agent and hasattr(agent, "conversation_history"):
-        agent.conversation_history = remaining
+        agent.conversation_history = [_to_replay_safe_message(msg) for msg in remaining]
 
     return JSONResponse(content={
         "status": "undone",

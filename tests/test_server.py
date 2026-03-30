@@ -23,6 +23,26 @@ async def collect_stream(response):
     return chunks
 
 
+def parse_sse_events(stream):
+    events = []
+    for block in stream.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event_type = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_type = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: ") :])
+        events.append({"event": event_type, "data": data})
+    return events
+
+
+def get_sse_events(stream, event_type):
+    return [event["data"] for event in parse_sse_events(stream) if event["event"] == event_type]
+
+
 class FakeSessionDB:
     def __init__(self):
         self.messages = {}
@@ -30,6 +50,22 @@ class FakeSessionDB:
         self.appended = []
 
     def get_messages_as_conversation(self, session_id):
+        conversation = []
+        for message in self.messages.get(session_id, []):
+            item = {
+                "role": message["role"],
+                "content": message.get("content"),
+            }
+            if message.get("tool_name") is not None:
+                item["tool_name"] = message.get("tool_name")
+            if message.get("tool_calls") is not None:
+                item["tool_calls"] = message.get("tool_calls")
+            if message.get("tool_call_id") is not None:
+                item["tool_call_id"] = message.get("tool_call_id")
+            conversation.append(item)
+        return conversation
+
+    def get_messages(self, session_id):
         return list(self.messages.get(session_id, []))
 
     def clear_messages(self, session_id):
@@ -45,6 +81,10 @@ class FakeSessionDB:
                 "tool_name": kwargs.get("tool_name"),
                 "tool_calls": kwargs.get("tool_calls"),
                 "tool_call_id": kwargs.get("tool_call_id"),
+                "finish_reason": kwargs.get("finish_reason"),
+                "reasoning": kwargs.get("reasoning"),
+                "reasoning_details": kwargs.get("reasoning_details"),
+                "codex_reasoning_items": kwargs.get("codex_reasoning_items"),
             }
         )
 
@@ -450,6 +490,78 @@ class TestReasoningConfigResolution:
 
 
 class TestSessionEndpoints:
+    def test_load_best_history_preserves_replay_fields_from_db_file_and_agent(self, tmp_path):
+        module = load_server_module()
+        module.SESSION_FILES_DIR = tmp_path
+
+        db_message = {
+            "role": "assistant",
+            "content": "db answer",
+            "finish_reason": "stop",
+            "reasoning": "db reasoning",
+            "reasoning_details": [{"type": "summary", "text": "db detail"}],
+            "codex_reasoning_items": [{"id": "db-r1", "encrypted_content": "enc-db"}],
+            "tool_calls": [{"function": {"name": "web_search", "arguments": "{}"}}],
+        }
+        file_message = {
+            "role": "assistant",
+            "content": "file answer",
+            "finish_reason": "length",
+            "reasoning": "file reasoning",
+            "reasoning_details": [{"type": "summary", "text": "file detail"}],
+            "codex_reasoning_items": [{"id": "file-r1", "encrypted_content": "enc-file"}],
+        }
+        agent_message = {
+            "role": "assistant",
+            "content": "agent answer",
+            "finish_reason": "tool_calls",
+            "reasoning": "agent reasoning",
+            "reasoning_details": [{"type": "summary", "text": "agent detail"}],
+            "codex_reasoning_items": [{"id": "agent-r1", "encrypted_content": "enc-agent"}],
+        }
+
+        module._session_db.messages["db-sess"] = [db_message]
+        file_path = tmp_path / "session_file-sess.json"
+        file_path.write_text(json.dumps({"messages": [file_message]}), encoding="utf-8")
+        module._session_agents["agent-sess"] = SimpleNamespace(conversation_history=[agent_message])
+
+        _, db_history = module._load_best_history("db-sess")
+        _, file_history = module._load_best_history("file-sess")
+        _, agent_history = module._load_best_history("agent-sess")
+
+        assert db_history == [db_message]
+        assert file_history == [file_message]
+        assert agent_history == [agent_message]
+
+    def test_rewrite_session_history_preserves_reasoning_and_finish_metadata(self, tmp_path):
+        module = load_server_module()
+        module.SESSION_FILES_DIR = tmp_path
+        file_path = tmp_path / "session_sess-1.json"
+        file_path.write_text(json.dumps({"messages": []}), encoding="utf-8")
+
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "finish_reason": "stop",
+                "reasoning": "chain of thought",
+                "reasoning_details": [{"type": "summary", "text": "detail"}],
+                "codex_reasoning_items": [{"id": "r1", "encrypted_content": "enc-1"}],
+                "tool_calls": [{"function": {"name": "web_search", "arguments": "{}"}}],
+            },
+        ]
+
+        module._rewrite_session_history("sess-1", messages)
+
+        assert module._session_db.appended[1]["finish_reason"] == "stop"
+        assert module._session_db.appended[1]["reasoning"] == "chain of thought"
+        assert module._session_db.appended[1]["reasoning_details"] == [{"type": "summary", "text": "detail"}]
+        assert module._session_db.appended[1]["codex_reasoning_items"] == [{"id": "r1", "encrypted_content": "enc-1"}]
+
+        rewritten_file = json.loads(file_path.read_text(encoding="utf-8"))
+        assert rewritten_file["messages"] == messages
+
     def test_cancel_handles_success_and_missing_session(self):
         module = load_server_module()
         active = module.ActiveSession(
@@ -497,9 +609,21 @@ class TestSessionEndpoints:
         db = module._session_db
         db.messages["sess-1"] = [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "hello",
+                "finish_reason": "stop",
+                "reasoning": "kept reasoning",
+                "reasoning_details": [{"type": "summary", "text": "kept detail"}],
+                "codex_reasoning_items": [{"id": "keep-1", "encrypted_content": "enc-keep"}],
+            },
             {"role": "user", "content": "redo"},
-            {"role": "assistant", "content": "later"},
+            {
+                "role": "assistant",
+                "content": "later",
+                "finish_reason": "stop",
+                "reasoning": "removed reasoning",
+            },
         ]
         agent = SimpleNamespace(conversation_history=list(db.messages["sess-1"]))
         module._session_agents["sess-1"] = agent
@@ -512,8 +636,71 @@ class TestSessionEndpoints:
         assert len(db.appended) == 2
         assert agent.conversation_history == [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "hello",
+                "finish_reason": "stop",
+                "reasoning": "kept reasoning",
+                "reasoning_details": [{"type": "summary", "text": "kept detail"}],
+                "codex_reasoning_items": [{"id": "keep-1", "encrypted_content": "enc-keep"}],
+            },
         ]
+        assert db.messages["sess-1"][1]["reasoning"] == "kept reasoning"
+        assert db.messages["sess-1"][1]["finish_reason"] == "stop"
+        assert db.messages["sess-1"][1]["codex_reasoning_items"] == [
+            {"id": "keep-1", "encrypted_content": "enc-keep"}
+        ]
+
+    def test_compaction_summary_injection_preserves_later_assistant_fields(self):
+        module = load_server_module()
+        source_messages = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": "first answer",
+                "reasoning": "source reasoning",
+            },
+        ]
+        module._session_db.messages["sess-1"] = [
+            {"role": "user", "content": "surviving user"},
+            {
+                "role": "assistant",
+                "content": "surviving answer",
+                "finish_reason": "stop",
+                "reasoning": "surviving reasoning",
+                "reasoning_details": [{"type": "summary", "text": "surviving detail"}],
+                "codex_reasoning_items": [{"id": "survive-1", "encrypted_content": "enc-survive"}],
+            },
+        ]
+        agent = SimpleNamespace(conversation_history=list(module._session_db.messages["sess-1"]))
+        module._session_agents["sess-1"] = agent
+
+        injected = module._ensure_compaction_summary("sess-1", source_messages)
+
+        assert injected is True
+        assert module._session_db.messages["sess-1"][0]["content"].startswith(module.SUMMARY_PREFIX)
+        assert module._session_db.messages["sess-1"][2]["reasoning"] == "surviving reasoning"
+        assert module._session_db.messages["sess-1"][2]["reasoning_details"] == [
+            {"type": "summary", "text": "surviving detail"}
+        ]
+        assert module._session_db.messages["sess-1"][2]["codex_reasoning_items"] == [
+            {"id": "survive-1", "encrypted_content": "enc-survive"}
+        ]
+        assert agent.conversation_history[2]["finish_reason"] == "stop"
+
+    def test_load_best_history_preserves_codex_reasoning_only_assistant_messages(self):
+        module = load_server_module()
+        codex_message = {
+            "role": "assistant",
+            "content": "",
+            "finish_reason": "incomplete",
+            "codex_reasoning_items": [{"id": "codex-1", "encrypted_content": "enc-codex"}],
+        }
+        module._session_agents["sess-1"] = SimpleNamespace(conversation_history=[codex_message])
+
+        _, history = module._load_best_history("sess-1")
+
+        assert history == [codex_message]
 
     def test_status_returns_live_agent_details(self):
         module = load_server_module()
@@ -828,7 +1015,15 @@ class TestStreamingAndAgentBehavior:
                 clarify_queue.put_nowait,
                 ("clarify", {"question": "Pick one", "choices": ["A", "B"]}),
             )
-            return {"final_response": "Hello world", "_session_id": "sess-2"}
+            return {
+                "final_response": "Hello world",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-2",
+            }
 
         module._run_agent_sync = fake_run_agent_sync
 
@@ -844,12 +1039,27 @@ class TestStreamingAndAgentBehavior:
         )
         chunks = run(collect_stream(response))
         stream = "".join(chunks)
+        end_payload = get_sse_events(stream, "End")[0]["data"]
 
         assert response.headers["X-Conversation-Id"] == "sess-1"
         assert 'event: PartStartEvent\ndata: {"part": {"part_kind": "thinking", "content": "Plan the answer"}}' in stream
         assert 'event: PartDeltaEvent\ndata: {"delta": {"part_delta_kind": "text", "content_delta": "Hello "}}' in stream
         assert 'event: ClarifyEvent\ndata: {"question": "Pick one", "choices": ["A", "B"], "session_id": "sess-1"}' in stream
-        assert 'event: End\ndata: {"data": {"output": "Hello world", "conversation_id": "sess-2"}}' in stream
+        assert end_payload == {
+            "output": "Hello world",
+            "conversation_id": "sess-2",
+            "result": {
+                "turn_status": "completed",
+                "output_source": "final_response",
+                "output_present": True,
+                "hermes_final_response_present": True,
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+            },
+        }
 
     def test_streaming_emits_error_event_on_failure(self):
         module = load_server_module()
@@ -871,13 +1081,23 @@ class TestStreamingAndAgentBehavior:
         )
         stream = "".join(run(collect_stream(response)))
 
-        assert 'event: SSEErrorEvent\ndata: {"message": "boom"}' in stream
+        assert get_sse_events(stream, "SSEErrorEvent") == [
+            {"message": "boom", "turn_status": "error"}
+        ]
 
     def test_streaming_ask_keeps_session_active_until_stream_finishes(self):
         module = load_server_module()
 
         def fake_run_agent_sync(*args, **kwargs):
-            return {"final_response": "done", "_session_id": "sess-1"}
+            return {
+                "final_response": "done",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-1",
+            }
 
         module._run_agent_sync = fake_run_agent_sync
 
@@ -886,9 +1106,437 @@ class TestStreamingAndAgentBehavior:
         assert "sess-1" in module._active_sessions
 
         stream = "".join(run(collect_stream(response)))
+        end_payload = get_sse_events(stream, "End")[0]["data"]
 
-        assert 'event: End\ndata: {"data": {"output": "done", "conversation_id": "sess-1"}}' in stream
+        assert end_payload["output"] == "done"
+        assert end_payload["conversation_id"] == "sess-1"
+        assert end_payload["result"]["turn_status"] == "completed"
         assert "sess-1" not in module._active_sessions
+
+    def test_non_streaming_completed_turn_returns_result_envelope(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "done",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+
+        body = json.loads(response.body)
+        assert body["output"] == "done"
+        assert body["result"] == {
+            "turn_status": "completed",
+            "output_source": "final_response",
+            "output_present": True,
+            "hermes_final_response_present": True,
+            "completed": True,
+            "partial": False,
+            "failed": False,
+            "interrupted": False,
+            "error": None,
+        }
+
+    def test_streaming_completed_turn_end_result_matches_non_streaming(self):
+        module = load_server_module()
+        hermes_result = {
+            "final_response": "done",
+            "completed": True,
+            "partial": False,
+            "failed": False,
+            "interrupted": False,
+            "error": None,
+            "_session_id": "sess-1",
+        }
+
+        module._run_agent_sync = lambda *args, **kwargs: dict(hermes_result)
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        non_stream_body = json.loads(response.body)
+
+        module._run_agent_sync = lambda *args, **kwargs: dict(hermes_result)
+        stream_response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        stream = "".join(run(collect_stream(stream_response)))
+        end_payload = get_sse_events(stream, "End")[0]["data"]
+
+        assert end_payload["output"] == "done"
+        assert end_payload["result"] == non_stream_body["result"]
+
+    def test_completed_streamed_only_turn_uses_streamed_text(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(
+            user_message,
+            session_id,
+            model,
+            max_iterations,
+            cancel_event,
+            active_session,
+            loop,
+            thinking_queue=None,
+            message_queue=None,
+            clarify_queue=None,
+            **kwargs,
+        ):
+            loop.call_soon_threadsafe(message_queue.put_nowait, ("message", "Hello "))
+            loop.call_soon_threadsafe(message_queue.put_nowait, ("message", "world"))
+            return {
+                "final_response": "",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        stream = "".join(run(collect_stream(response)))
+        end_payload = get_sse_events(stream, "End")[0]["data"]
+
+        assert end_payload["output"] == "Hello world"
+        assert end_payload["result"] == {
+            "turn_status": "completed_streamed_only",
+            "output_source": "streamed_text",
+            "output_present": True,
+            "hermes_final_response_present": False,
+            "completed": True,
+            "partial": False,
+            "failed": False,
+            "interrupted": False,
+            "error": None,
+        }
+
+    def test_streaming_end_uses_authoritative_bridge_streamed_text(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-1",
+                "_bridge_streamed_text": "Hello world",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        stream = "".join(run(collect_stream(response)))
+        end_payload = get_sse_events(stream, "End")[0]["data"]
+
+        assert end_payload["output"] == "Hello world"
+        assert end_payload["result"]["turn_status"] == "completed_streamed_only"
+
+    def test_empty_success_turn_has_no_output(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "",
+                "completed": True,
+                "partial": False,
+                "failed": False,
+                "interrupted": False,
+                "error": None,
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert body["output"] == ""
+        assert body["result"]["turn_status"] == "empty_success"
+        assert body["result"]["output_source"] == "none"
+        assert body["result"]["output_present"] is False
+
+    def test_partial_turn_preserves_error_text(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "partial answer",
+                "completed": False,
+                "partial": True,
+                "failed": False,
+                "interrupted": False,
+                "error": "tool timeout",
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert body["output"] == "partial answer"
+        assert body["result"]["turn_status"] == "partial"
+        assert body["result"]["error"] == "tool timeout"
+
+    def test_failed_turn_with_text_uses_final_response(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "failed answer",
+                "completed": False,
+                "partial": False,
+                "failed": True,
+                "interrupted": False,
+                "error": "model failure",
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert body["output"] == "failed answer"
+        assert body["result"]["turn_status"] == "failed"
+        assert body["result"]["output_source"] == "final_response"
+
+    def test_failed_turn_without_text_uses_none_output_source(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "",
+                "completed": False,
+                "partial": False,
+                "failed": True,
+                "interrupted": False,
+                "error": "model failure",
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert body["output"] == ""
+        assert body["result"]["turn_status"] == "failed"
+        assert body["result"]["output_source"] == "none"
+
+    def test_interrupted_turn_maps_to_partial_and_preserves_flag(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            return {
+                "final_response": "partial answer",
+                "completed": False,
+                "partial": True,
+                "failed": False,
+                "interrupted": True,
+                "error": None,
+                "_session_id": "sess-1",
+            }
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert body["result"]["turn_status"] == "partial"
+        assert body["result"]["interrupted"] is True
+
+    def test_non_streaming_bridge_exception_returns_error_result(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_non_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        body = json.loads(response.body)
+
+        assert response.status_code == 500
+        assert body["output"] == ""
+        assert body["error"] == "boom"
+        assert body["result"]["turn_status"] == "error"
+        assert body["result"]["output_source"] == "none"
+
+    def test_streaming_bridge_exception_emits_error_without_fake_end(self):
+        module = load_server_module()
+
+        def fake_run_agent_sync(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        module._run_agent_sync = fake_run_agent_sync
+
+        response = run(
+            module._handle_streaming(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+            )
+        )
+        stream = "".join(run(collect_stream(response)))
+
+        error_events = get_sse_events(stream, "SSEErrorEvent")
+        end_events = get_sse_events(stream, "End")
+        assert error_events == [{"message": "boom", "turn_status": "error"}]
+        assert end_events == []
+
+    def test_run_agent_sync_captures_streamed_text_without_message_queue(self):
+        module = load_server_module()
+
+        class StreamingOnlyAgent:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs["session_id"]
+
+            def run_conversation(self, **kwargs):
+                stream_callback = kwargs["stream_callback"]
+                stream_callback("Hello ")
+                stream_callback("world")
+                return {
+                    "final_response": "",
+                    "completed": True,
+                    "partial": False,
+                    "failed": False,
+                    "interrupted": False,
+                    "error": None,
+                }
+
+            def interrupt(self, message):
+                pass
+
+        module.AIAgent = StreamingOnlyAgent
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = module._run_agent_sync(
+                "hello",
+                "sess-1",
+                "gpt-5.4",
+                5,
+                __import__("threading").Event(),
+                None,
+                loop,
+                message_queue=None,
+            )
+        finally:
+            loop.close()
+
+        assert result["_bridge_streamed_text"] == "Hello world"
 
     def test_run_agent_sync_deduplicates_reasoning_and_passes_overlay_separately(self):
         module = load_server_module()
