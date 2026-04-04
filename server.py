@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,6 +104,7 @@ from run_agent import AIAgent  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
 from agent import prompt_builder as _prompt_builder  # noqa: E402
+from agent.memory_manager import MemoryManager as _HermesMemoryManager  # noqa: E402
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,57 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("zo-hermes")
+
+_memory_session_title_override = threading.local()
+
+
+def _get_memory_session_title_override() -> Optional[str]:
+    return getattr(_memory_session_title_override, "session_title", None)
+
+
+@contextmanager
+def _memory_session_title_scope(session_title: Optional[str]):
+    previous = _get_memory_session_title_override()
+    if session_title:
+        _memory_session_title_override.session_title = session_title
+    else:
+        _memory_session_title_override.__dict__.pop("session_title", None)
+    try:
+        yield
+    finally:
+        if previous:
+            _memory_session_title_override.session_title = previous
+        else:
+            _memory_session_title_override.__dict__.pop("session_title", None)
+
+
+_original_memory_manager_initialize_all = _HermesMemoryManager.initialize_all
+
+
+def _get_active_memory_provider() -> str:
+    try:
+        cfg = hermes_config.load_config() or {}
+    except Exception:
+        return ""
+    memory_cfg = cfg.get("memory")
+    if not isinstance(memory_cfg, dict):
+        return ""
+    provider = memory_cfg.get("provider")
+    return str(provider).strip().lower() if provider else ""
+
+
+def _initialize_all_with_memory_session_title_override(self, session_id: str, **kwargs) -> None:
+    session_title = _get_memory_session_title_override()
+    if (
+        session_title
+        and _get_active_memory_provider() == "honcho"
+        and "session_title" not in kwargs
+    ):
+        kwargs["session_title"] = session_title
+    return _original_memory_manager_initialize_all(self, session_id, **kwargs)
+
+
+_HermesMemoryManager.initialize_all = _initialize_all_with_memory_session_title_override
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -703,7 +756,7 @@ class AskRequest(BaseModel):
     input: str
     stream: bool = False
     session_id: Optional[str] = Field(None, alias="conversation_id")
-    honcho_session_key: Optional[str] = None
+    memory_session_title: Optional[str] = None
     model_name: Optional[str] = None
     persona_id: Optional[str] = None
     ephemeral_system_prompt: Optional[str] = None
@@ -745,7 +798,7 @@ def _run_agent_sync(
     message_queue: Optional[asyncio.Queue] = None,
     clarify_queue: Optional[asyncio.Queue] = None,
     ephemeral_system_prompt: Optional[str] = None,
-    honcho_session_key: Optional[str] = None,
+    memory_session_title: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -858,34 +911,32 @@ def _run_agent_sync(
         agent_kwargs["enabled_toolsets"] = enabled_toolsets
     if disabled_toolsets is not None:
         agent_kwargs["disabled_toolsets"] = disabled_toolsets
-    if honcho_session_key is not None:
-        agent_kwargs["honcho_session_key"] = honcho_session_key
+    with _memory_session_title_scope(memory_session_title):
+        agent = AIAgent(**agent_kwargs)
+        _session_agents[session_id] = agent
 
-    agent = AIAgent(**agent_kwargs)
-    _session_agents[session_id] = agent
+        # Translate API-level cancel requests into Hermes' native interrupt path.
+        def _watch_for_cancel() -> None:
+            cancel_event.wait()
+            try:
+                agent.interrupt("Interrupted by a newer Discord message.")
+            except Exception:
+                logger.exception("Failed to interrupt agent for session %s", session_id)
 
-    # Translate API-level cancel requests into Hermes' native interrupt path.
-    def _watch_for_cancel() -> None:
-        cancel_event.wait()
+        cancel_watcher = threading.Thread(target=_watch_for_cancel, daemon=True)
+        cancel_watcher.start()
+
+        # Change CWD for file access parity with Zo.
+        original_cwd = os.getcwd()
         try:
-            agent.interrupt("Interrupted by a newer Discord message.")
-        except Exception:
-            logger.exception("Failed to interrupt agent for session %s", session_id)
-
-    cancel_watcher = threading.Thread(target=_watch_for_cancel, daemon=True)
-    cancel_watcher.start()
-
-    # Change CWD for file access parity with Zo.
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(HERMES_CWD)
-        result = agent.run_conversation(
-            user_message=user_message,
-            conversation_history=conversation_history,
-            stream_callback=stream_cb,
-        )
-    finally:
-        os.chdir(original_cwd)
+            os.chdir(HERMES_CWD)
+            result = agent.run_conversation(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                stream_callback=stream_cb,
+            )
+        finally:
+            os.chdir(original_cwd)
 
     # After compression, agent.session_id may have changed. Propagate it.
     effective_id = agent.session_id
@@ -960,7 +1011,7 @@ async def ask(req: AskRequest):
                 req.input, session_id, model, max_iterations, cancel_event,
                 active_session,
                 ephemeral_system_prompt=req.ephemeral_system_prompt,
-                honcho_session_key=req.honcho_session_key,
+                memory_session_title=req.memory_session_title,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
@@ -974,7 +1025,7 @@ async def ask(req: AskRequest):
         req.input, session_id, model, max_iterations, cancel_event,
         active_session,
         ephemeral_system_prompt=req.ephemeral_system_prompt,
-        honcho_session_key=req.honcho_session_key,
+        memory_session_title=req.memory_session_title,
         reasoning_effort=reasoning_effort, skip_memory=skip_memory,
         skip_context=skip_context, enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets, model_fallback=model_fallback,
@@ -990,7 +1041,7 @@ async def _handle_non_streaming(
     cancel_event: threading.Event,
     active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
-    honcho_session_key: Optional[str] = None,
+    memory_session_title: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -1016,7 +1067,7 @@ async def _handle_non_streaming(
                 thinking_queue=None,
                 message_queue=None,
                 ephemeral_system_prompt=ephemeral_system_prompt,
-                honcho_session_key=honcho_session_key,
+                memory_session_title=memory_session_title,
                 reasoning_effort=reasoning_effort, skip_memory=skip_memory,
                 skip_context=skip_context, enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -1073,7 +1124,7 @@ async def _handle_streaming(
     cancel_event: threading.Event,
     active_session: Optional[ActiveSession] = None,
     ephemeral_system_prompt: Optional[str] = None,
-    honcho_session_key: Optional[str] = None,
+    memory_session_title: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     skip_memory: bool = False,
     skip_context: bool = False,
@@ -1103,7 +1154,7 @@ async def _handle_streaming(
             message_queue=message_queue,
             clarify_queue=clarify_queue,
             ephemeral_system_prompt=ephemeral_system_prompt,
-            honcho_session_key=honcho_session_key,
+            memory_session_title=memory_session_title,
             reasoning_effort=reasoning_effort, skip_memory=skip_memory,
             skip_context=skip_context, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,

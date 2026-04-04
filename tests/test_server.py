@@ -166,6 +166,13 @@ def load_server_module(config_data=None):
 
     fake_fastapi = types.ModuleType("fastapi")
     fake_fastapi_responses = types.ModuleType("fastapi.responses")
+    fake_memory_manager = types.ModuleType("agent.memory_manager")
+
+    class FakeMemoryManager:
+        def initialize_all(self, session_id: str, **kwargs):
+            return None
+
+    fake_memory_manager.MemoryManager = FakeMemoryManager
 
     class FakeFastAPI:
         def __init__(self, *args, **kwargs):
@@ -243,6 +250,7 @@ def load_server_module(config_data=None):
     sys.modules["model_tools"] = fake_model_tools
     sys.modules["agent"] = fake_agent_parent
     sys.modules["agent.prompt_builder"] = fake_prompt_builder
+    sys.modules["agent.memory_manager"] = fake_memory_manager
     sys.modules["agent.context_compressor"] = fake_context_compressor
     sys.modules["fastapi"] = fake_fastapi
     sys.modules["fastapi.responses"] = fake_fastapi_responses
@@ -269,13 +277,13 @@ class TestAskRequest:
         req = module.AskRequest.model_validate({"input": "hello", "session_id": "sess-1"})
         assert req.session_id == "sess-1"
 
-    def test_accepts_honcho_session_key(self):
+    def test_accepts_memory_session_title(self):
         module = load_server_module()
         req = module.AskRequest.model_validate(
-            {"input": "hello", "conversation_id": "conv-1", "honcho_session_key": "discord-thread-123"}
+            {"input": "hello", "conversation_id": "conv-1", "memory_session_title": "discord-thread-123"}
         )
         assert req.session_id == "conv-1"
-        assert req.honcho_session_key == "discord-thread-123"
+        assert req.memory_session_title == "discord-thread-123"
 
 
 class TestZoMcpConfigExpansion:
@@ -369,7 +377,7 @@ class TestAskEndpoint:
                 "input": "hello",
                 "stream": False,
                 "conversation_id": "conv-1",
-                "honcho_session_key": "discord-thread-123",
+                "memory_session_title": "discord-thread-123",
                 "reasoning_effort": "high",
                 "skip_memory": True,
                 "skip_context": True,
@@ -382,7 +390,7 @@ class TestAskEndpoint:
         run(module.ask(req))
 
         assert captured["args"][1] == "conv-1"
-        assert captured["kwargs"]["honcho_session_key"] == "discord-thread-123"
+        assert captured["kwargs"]["memory_session_title"] == "discord-thread-123"
         assert captured["kwargs"]["reasoning_effort"] == "high"
         assert captured["kwargs"]["skip_memory"] is True
         assert captured["kwargs"]["skip_context"] is True
@@ -1572,15 +1580,50 @@ class TestStreamingAndAgentBehavior:
             SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args)),
             thinking_queue=thinking_queue,
             ephemeral_system_prompt="## Message Source\nDiscord context",
-            honcho_session_key="discord-thread-123",
+            memory_session_title="discord-thread-123",
         )
 
         assert result["_session_id"] == "sess-1"
         assert captured["kwargs"]["pass_session_id"] is True
-        assert captured["kwargs"]["honcho_session_key"] == "discord-thread-123"
+        assert "memory_session_title" not in captured["kwargs"]
         assert captured["user_message"] == "Original prompt"
         assert captured["kwargs"]["ephemeral_system_prompt"] == "## Message Source\nDiscord context"
         assert queued == [("thinking", "Plan the answer carefully with detailed steps and reflect before replying.")]
+
+    def test_memory_session_title_scope_injects_session_title_for_memory_manager(self):
+        module = load_server_module()
+        captured = {}
+
+        original = module._original_memory_manager_initialize_all
+
+        def fake_initialize_all(self, session_id: str, **kwargs):
+            captured["session_id"] = session_id
+            captured["kwargs"] = kwargs
+
+        module._original_memory_manager_initialize_all = fake_initialize_all
+        manager = module._HermesMemoryManager()
+        module.hermes_config.load_config = lambda: {"memory": {"provider": "honcho"}}
+
+        try:
+            with module._memory_session_title_scope("discord-thread-123"):
+                module._initialize_all_with_memory_session_title_override(manager, "sess-1", platform="discord")
+        finally:
+            module._original_memory_manager_initialize_all = original
+
+        assert captured["session_id"] == "sess-1"
+        assert captured["kwargs"]["session_title"] == "discord-thread-123"
+        assert captured["kwargs"]["platform"] == "discord"
+
+    def test_memory_session_title_scope_restores_previous_value(self):
+        module = load_server_module()
+
+        assert module._get_memory_session_title_override() is None
+        with module._memory_session_title_scope("outer"):
+            assert module._get_memory_session_title_override() == "outer"
+            with module._memory_session_title_scope("inner"):
+                assert module._get_memory_session_title_override() == "inner"
+            assert module._get_memory_session_title_override() == "outer"
+        assert module._get_memory_session_title_override() is None
 
     def test_run_agent_sync_uses_config_reasoning_default_when_request_omitted(self):
         module = load_server_module()
