@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-HERMES_ROOT = Path("/opt/hermes-agent")
+HERMES_ROOT = Path(os.getenv("HERMES_ROOT", "/opt/hermes-agent")).expanduser()
 if str(HERMES_ROOT) not in sys.path:
     sys.path.insert(0, str(HERMES_ROOT))
 

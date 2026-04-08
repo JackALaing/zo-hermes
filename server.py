@@ -59,7 +59,7 @@ def _expand_config_env(value):
 # ---------------------------------------------------------------------------
 # Hermes imports — add repo to path
 # ---------------------------------------------------------------------------
-HERMES_ROOT = Path("/opt/hermes-agent")
+HERMES_ROOT = Path(os.getenv("HERMES_ROOT", "/opt/hermes-agent")).expanduser()
 sys.path.insert(0, str(HERMES_ROOT))
 
 from hermes_cli import config as hermes_config  # noqa: E402
@@ -171,6 +171,8 @@ _HermesMemoryManager.initialize_all = _initialize_all_with_memory_session_title_
 # Configuration
 # ---------------------------------------------------------------------------
 def _load_required_hermes_defaults() -> tuple[str, int]:
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    config_path = hermes_home / "config.yaml"
     try:
         cfg = hermes_config.load_config()
     except Exception as exc:
@@ -206,7 +208,7 @@ def _load_required_hermes_defaults() -> tuple[str, int]:
         missing.append("agent.max_turns")
     if missing:
         raise RuntimeError(
-            "zo-hermes requires Hermes defaults in ~/.hermes/config.yaml. "
+            f"zo-hermes requires Hermes defaults in {config_path}. "
             f"Missing or invalid: {', '.join(missing)}"
         )
 
@@ -215,13 +217,12 @@ def _load_required_hermes_defaults() -> tuple[str, int]:
 
 PORT = int(os.getenv("HERMES_API_PORT", "8788"))
 DEFAULT_MODEL, DEFAULT_MAX_ITERATIONS = _load_required_hermes_defaults()
-HERMES_CWD = os.getenv("HERMES_CWD", "/home/workspace")
-# Keep Hermes context discovery anchored to the Zo workspace rather than the
-# hermes-agent install directory. Upstream Hermes now prefers TERMINAL_CWD when
-# building context-file prompt sections, so align it with the bridge's working
-# tree here.
+HERMES_CWD = os.getenv("HERMES_CWD", str(Path.home()))
+# Keep Hermes context discovery anchored to the configured working tree rather
+# than the hermes-agent install directory.
 os.environ["TERMINAL_CWD"] = HERMES_CWD
-SESSION_FILES_DIR = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "sessions"
+HERMES_HOME = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+SESSION_FILES_DIR = HERMES_HOME / "sessions"
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +965,7 @@ def _sse_event(event_type: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("zo-hermes starting on port %d, CWD=%s", PORT, HERMES_CWD)
+    logger.info("zo-hermes starting on port %d, HERMES_HOME=%s, CWD=%s", PORT, HERMES_HOME, HERMES_CWD)
     yield
     logger.info("zo-hermes shutting down")
 
